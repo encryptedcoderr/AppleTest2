@@ -88,7 +88,7 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # NEW: Debug the file generation process itself with LLDB
+      # Debug the file generation process itself with LLDB
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -97,8 +97,6 @@ jobs:
           echo "Timestamp: $(date)" >> $LOG_FILE
           
           echo "Creating LLDB command script..."
-          # Improved: Create a command script for LLDB for better reliability in CI.
-          # This avoids potential permission issues with direct process attachment/control.
           cat > debug_script.lldb << 'EOF'
           breakpoint set --file encodeme.mm --line 30
           run
@@ -111,28 +109,33 @@ jobs:
           EOF
           
           echo "Starting LLDB session with script to inspect the invalid header creation..." >> $LOG_FILE
-          # Improved: Execute LLDB with the script file.
           lldb -s debug_script.lldb ./encodeme_debug >> $LOG_FILE 2>&1
             
           echo "✅ Generation debug log created. Displaying contents:"
           cat $LOG_FILE
           
-      # Play the generated (invalid) file and debug the player
-      - name: Play and Debug Audio Player
+      # Improved: Launch the player directly under LLDB to catch any startup crashes
+      - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
           echo "--- Debugging Audio Player (afplay) ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
-          echo "Starting audio playback in background..."
-          afplay output_invalid.mp3 &
-          MP3_PID=$!
-          echo "Started MP3 playback with PID: $MP3_PID" >> $PLAYER_LOG_FILE
-          sleep 2
+          echo "Creating LLDB script to launch and monitor afplay..."
+          # This script will launch afplay. If it crashes, LLDB will stop and provide a backtrace.
+          cat > player_debug_script.lldb << 'EOF'
+          # Run the process. LLDB will stop if a crash occurs.
+          run
+          # If the process crashed, get the backtrace. If it exited normally, this shows the state at exit.
+          bt
+          quit
+          EOF
 
-          echo "--- Attaching LLDB to MP3 Player Process (PID: $MP3_PID) ---" >> $PLAYER_LOG_FILE
-          lldb -p $MP3_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $PLAYER_LOG_FILE 2>&1 || echo "Could not attach to MP3 player process. It may have crashed or finished." >> $PLAYER_LOG_FILE
+          echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
+          # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
+          # We add '|| true' because afplay is expected to exit with an error, and we don't want this to fail the step.
+          lldb -s player_debug_script.lldb -- afplay output_invalid.mp3 >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
