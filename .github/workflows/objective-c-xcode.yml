@@ -1,4 +1,4 @@
-name: Generate and Play Audio Files
+name: Generate, Play, and Debug Audio
 on:
   push:
     branches: [ main ]
@@ -7,32 +7,27 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-generate-and-play:
+  build-generate-and-debug:
     runs-on: macos-latest
 
     steps:
       # Clone the repository
       - name: Clone repository
         run: |
-          echo "Cloning repository at $(date)"
+          echo "Cloning repository..."
           git clone https://github.com/encryptedcoderr/AppleTest/
-          echo "Repository cloned at $(date)"
-
+          
       # Navigate and list directory contents
       - name: Navigate and list directory contents
-        run: |
-          echo "Navigating to directory at $(date)"
-          cd AppleTest/apple-positional-audio-codec-invalid-header-main
-          echo "Listing directory contents at $(date)"
-          ls -l
-          echo "Directory listing completed at $(date)"
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        run: ls -l
 
       # Patch encodeme.mm for 10-second M4A
       - name: Patch encodeme.mm
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm at $(date)"
-          cat > encodeme.mm << EOF
+          echo "Patching encodeme.mm..."
+          cat > encodeme.mm << 'EOF'
           @import AVFAudio;
           @import AudioToolbox;
           #include <cmath>
@@ -44,212 +39,106 @@ jobs:
                   [AVAudioChannelLayout layoutWithLayoutTag:kAudioChannelLayoutTag_Mono];
               const int sampleRate = 44100;
               const int durationSeconds = 10;
-              const int totalSamples = sampleRate * durationSeconds; // 441,000 samples
-              const int samplesPerBuffer = 1024; // Frame size for AAC
+              const int totalSamples = sampleRate * durationSeconds;
+              const int samplesPerBuffer = 1024;
               float* audioBuffer = (float*)malloc(samplesPerBuffer * sizeof(float));
-              // --- M4A Output (AAC) ---
+              
               AudioStreamBasicDescription m4aDescription{
                   .mSampleRate = 44100,
                   .mFormatID = kAudioFormatMPEG4AAC,
-                  .mFormatFlags = 0,
-                  .mBytesPerPacket = 0,
                   .mFramesPerPacket = 1024,
-                  .mBytesPerFrame = 0,
                   .mChannelsPerFrame = channelNum,
-                  .mBitsPerChannel = 0,
-                  .mReserved = 0
               };
               NSURL* m4aUrl = [NSURL fileURLWithPath:@"output.m4a"];
               ExtAudioFileRef m4aFile = nullptr;
               OSStatus status = ExtAudioFileCreateWithURL((__bridge CFURLRef)m4aUrl, kAudioFileM4AType,
                                                           &m4aDescription, channelLayout.layout,
                                                           kAudioFileFlags_EraseFile, &m4aFile);
-              if (status) {
-                  fprintf(stderr, "error creating M4A file: %x\n", status);
-                  free(audioBuffer);
-                  return 1;
-              }
-              status = ExtAudioFileSetProperty(m4aFile, kExtAudioFileProperty_ClientDataFormat,
-                                               sizeof(AudioStreamBasicDescription), formatIn.streamDescription);
-              if (status) {
-                  fprintf(stderr, "error setting M4A client format: %x\n", status);
-                  ExtAudioFileDispose(m4aFile);
-                  free(audioBuffer);
-                  return 1;
-              }
-              status = ExtAudioFileSetProperty(m4aFile, kExtAudioFileProperty_ClientChannelLayout,
-                                               sizeof(AudioChannelLayout), formatIn.channelLayout.layout);
-              if (status) {
-                  fprintf(stderr, "error setting M4A channel layout: %x\n", status);
-                  ExtAudioFileDispose(m4aFile);
-                  free(audioBuffer);
-                  return 1;
-              }
-              // Write audio to M4A
+              if (status) { return 1; }
+              
+              ExtAudioFileSetProperty(m4aFile, kExtAudioFileProperty_ClientDataFormat,
+                                      sizeof(AudioStreamBasicDescription), formatIn.streamDescription);
+
               for (int i = 0; i < totalSamples; i += samplesPerBuffer) {
                   int samplesToWrite = (i + samplesPerBuffer <= totalSamples) ? samplesPerBuffer : (totalSamples - i);
-                  // Generate 440 Hz sine wave
                   for (int j = 0; j < samplesToWrite; j++) {
                       audioBuffer[j] = sin(2 * M_PI * 440 * (i + j) / sampleRate) * 0.5f;
                   }
-                  AudioBufferList audioBufferList{
-                      .mNumberBuffers = 1,
-                      .mBuffers = {
-                          {
-                              .mNumberChannels = 1,
-                              .mDataByteSize = static_cast<UInt32>(samplesToWrite * sizeof(float)),
-                              .mData = audioBuffer,
-                          },
-                      },
-                  };
-                  status = ExtAudioFileWrite(m4aFile, samplesToWrite, &audioBufferList);
-                  if (status) {
-                      fprintf(stderr, "error writing M4A audio: %x\n", status);
-                      ExtAudioFileDispose(m4aFile);
-                      free(audioBuffer);
-                      return 1;
-                  }
+                  AudioBufferList audioBufferList{ .mNumberBuffers = 1, .mBuffers = {{ .mNumberChannels = 1, .mDataByteSize = static_cast<UInt32>(samplesToWrite * sizeof(float)), .mData = audioBuffer, },}, };
+                  ExtAudioFileWrite(m4aFile, samplesToWrite, &audioBufferList);
               }
+              
               free(audioBuffer);
-              // Close M4A file
-              status = ExtAudioFileDispose(m4aFile);
-              if (status) {
-                  fprintf(stderr, "error closing M4A file: %x\n", status);
-                  return 1;
-              }
+              ExtAudioFileDispose(m4aFile);
               return 0;
           }
           EOF
-          echo "encodeme.mm patched at $(date)"
 
-      # Set up specific Xcode version
+      # Set up Xcode
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '15.4' # Use a recent stable version
+          xcode-version: '15.4'
 
-      # Verify Xcode and clang version
-      - name: Verify Xcode and clang version
-        run: |
-          echo "Verifying Xcode and clang versions at $(date)"
-          xcodebuild -version
-          clang++ --version
-          xcrun --sdk macosx --show-sdk-path
-          echo "Verification completed at $(date)"
-
-      # Compile encodeme.mm for macOS
+      # Compile encodeme.mm
       - name: Compile encodeme.mm
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Preparing to compile encodeme.mm at $(date)"
-          clang++ -g -Os -std=c++2b -fmodules -fcxx-modules -fobjc-arc -arch arm64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -framework AVFAudio -framework AudioToolbox encodeme.mm -o encodeme
-          if [ $? -eq 0 ]; then
-            echo "Compilation successful at $(date)"
-          else
-            echo "Compilation failed at $(date)"
-            exit 1
-          fi
+          echo "Compiling..."
+          clang++ -g -Os -std=c++2b -fmodules -fcxx-modules -fobjc-arc -arch arm64 \
+            -isysroot $(xcrun --sdk macosx --show-sdk-path) \
+            -framework AVFAudio -framework AudioToolbox \
+            encodeme.mm -o encodeme
+          if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Run encodeme to generate output.m4a
-      - name: Run encodeme
+      # Generate M4A and convert to MP3
+      - name: Generate Audio Files
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Running encodeme at $(date)"
-          chmod +x encodeme
-          ./encodeme
-          if [ $? -eq 0 ]; then
-            echo "encodeme executed successfully at $(date)"
-          else
-            echo "encodeme execution failed at $(date)"
-            exit 1
-          fi
-
-      # Install FFmpeg for conversion
-      - name: Install FFmpeg
-        run: |
-          echo "Installing FFmpeg at $(date)"
+          chmod +x encodeme && ./encodeme
           brew install ffmpeg
-          echo "FFmpeg installed at $(date)"
-
-      # Convert M4A to MP3
-      - name: Convert M4A to MP3
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Converting output.m4a to output.mp3 at $(date)"
           ffmpeg -i output.m4a -c:a mp3 -b:a 128k -ac 1 output.mp3
-          if [ $? -eq 0 ]; then
-            echo "Conversion successful at $(date)"
-          else
-            echo "Conversion failed at $(date)"
-            exit 1
-          fi
-
-      # Verify generated files
-      - name: Verify generated files
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Checking for generated files at $(date)"
           ls -lh output.m4a output.mp3
 
-      # Play audio and track processes
-      - name: Play Audio and Track Processes
+      # Play, Track, and Debug Processes
+      - name: Play, Track, and Debug Audio Processes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Starting audio playback in the background..."
-          # Play M4A and get its PID
+          LOG_FILE="debug_log.txt"
+          echo "--- Playback and Debug Log ---" > $LOG_FILE
+          echo "Timestamp: $(date)" >> $LOG_FILE
+          
+          echo "Starting audio playback in background..."
           afplay output.m4a &
           M4A_PID=$!
-          echo "M4A_PID=$M4A_PID" >> $GITHUB_ENV
-          echo "Playing output.m4a with PID: $M4A_PID"
-
-          # Play MP3 and get its PID
           afplay output.mp3 &
           MP3_PID=$!
-          echo "MP3_PID=$MP3_PID" >> $GITHUB_ENV
-          echo "Playing output.mp3 with PID: $MP3_PID"
           
-          # Give processes a moment to appear in the process list
-          sleep 2 
-
-      # Log process information
-      - name: Log Playback Processes
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          LOG_FILE="playback_log.txt"
-          echo "--- Playback Process Log ---" > $LOG_FILE
-          echo "Timestamp: $(date)" >> $LOG_FILE
-          echo "" >> $LOG_FILE
+          echo "Started M4A playback with PID: $M4A_PID" >> $LOG_FILE
+          echo "Started MP3 playback with PID: $MP3_PID" >> $LOG_FILE
           
-          echo "Logging M4A playback process..."
-          M4A_PROCESS_INFO=$(ps -p ${{ env.M4A_PID }} -o pid,comm= | tail -n 1)
-          if [ -n "$M4A_PROCESS_INFO" ]; then
-            echo "M4A Playback (PID, Title): $M4A_PROCESS_INFO" >> $LOG_FILE
-          else
-            echo "M4A Playback (PID: ${{ env.M4A_PID }}) - Process not found or completed." >> $LOG_FILE
-          fi
-
-          echo "Logging MP3 playback process..."
-          MP3_PROCESS_INFO=$(ps -p ${{ env.MP3_PID }} -o pid,comm= | tail -n 1)
-          if [ -n "$MP3_PROCESS_INFO" ]; then
-            echo "MP3 Playback (PID, Title): $MP3_PROCESS_INFO" >> $LOG_FILE
-          else
-            echo "MP3 Playback (PID: ${{ env.MP3_PID }}) - Process not found or completed." >> $LOG_FILE
-          fi
-
-          echo "" >> $LOG_FILE
+          # Allow a moment for processes to initialize before attaching debugger
+          sleep 2
+          
+          echo "--- Attaching LLDB to M4A Process (PID: $M4A_PID) ---" >> $LOG_FILE
+          lldb -p $M4A_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $LOG_FILE 2>&1 || echo "Could not attach to M4A process. It may have already finished." >> $LOG_FILE
+          
+          echo "--- Attaching LLDB to MP3 Process (PID: $MP3_PID) ---" >> $LOG_FILE
+          lldb -p $MP3_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $LOG_FILE 2>&1 || echo "Could not attach to MP3 process. It may have already finished." >> $LOG_FILE
+          
           echo "--- End of Log ---" >> $LOG_FILE
-
-          echo "Generated Log:"
+          
+          echo "✅ Debug log created. Displaying contents:"
           cat $LOG_FILE
 
       # Upload all artifacts
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: generation-and-playback-artifacts
+          name: audio-and-debug-artifacts
           path: |
             AppleTest/apple-positional-audio-codec-invalid-header-main/output.m4a
             AppleTest/apple-positional-audio-codec-invalid-header-main/output.mp3
-            AppleTest/apple-positional-audio-codec-invalid-header-main/playback_log.txt
+            AppleTest/apple-positional-audio-codec-invalid-header-main/debug_log.txt
           retention-days: 7
           if-no-files-found: error
