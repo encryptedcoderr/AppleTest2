@@ -1,4 +1,4 @@
-name: Generate, Play, and Debug Audio Source
+name: Fuzz Core Audio with Google Project Zero Fuzzer
 on:
   push:
     branches: [ main ]
@@ -7,57 +7,19 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-generate-and-debug:
+  fuzz-and-test:
     runs-on: macos-latest
 
     steps:
-      # Clone the repository
-      - name: Clone repository
+      # Clone your repository which contains the Swift harness
+      - name: Clone Your Repository
         run: git clone https://github.com/encryptedcoderr/AppleTest2/
 
-      # Navigate to the correct directory
-      - name: Navigate to working directory
-        run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
+      # New Step: Clone the Google Project Zero tools repository
+      - name: Clone Google Project Zero p0tools
+        run: git clone https://github.com/googleprojectzero/p0tools.git
 
-      # This script is a simple utility to corrupt a file at a specific offset.
-      - name: Patch encodeme.mm to be a Simple File Corruptor
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Patching encodeme.mm to be a simple corruption utility..."
-          cat > encodeme.mm << 'EOF'
-          #import <Foundation/Foundation.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-
-          int main(int argc, const char * argv[]) {
-              if (argc != 3) {
-                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
-                  return 1;
-              }
-
-              const char* filePath = argv[1];
-              long offset = atol(argv[2]);
-
-              FILE *file = fopen(filePath, "r+b");
-              if (!file) {
-                  fprintf(stderr, "Failed to open file: %s\n", filePath);
-                  return 1;
-              }
-
-              fprintf(stderr, "Corrupting file at offset 0x%lx...\n", offset);
-              fseek(file, offset, SEEK_SET);
-              
-              // This is the malicious data that triggers the vulnerability
-              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-              fclose(file);
-              
-              fprintf(stderr, "Corruption complete.\n");
-              return 0;
-          }
-          EOF
-
-      # New Step: Create a custom Swift harness that uses AVAudioPlayer
+      # New Step: Create our Swift player harness
       - name: Create Swift Player Harness
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -69,7 +31,7 @@ jobs:
           class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
               var isPlaying = true
               func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-                  print("Playback finished. Success: \(flag)")
+                  // Don't print anything on success to keep logs clean.
                   isPlaying = false
               }
               func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
@@ -79,14 +41,11 @@ jobs:
           }
 
           if CommandLine.arguments.count < 2 {
-              print("Usage: ./harness <file_path>")
               exit(1)
           }
 
           let filePath = CommandLine.arguments[1]
           let fileURL = URL(fileURLWithPath: filePath)
-
-          print("Attempting to play: \(filePath)")
 
           do {
               let delegate = PlayerDelegate()
@@ -94,16 +53,12 @@ jobs:
               audioPlayer.delegate = delegate
               audioPlayer.play()
               
-              print("Playback started...")
               // Keep the program running while the audio plays.
               while delegate.isPlaying {
                   RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
               }
-              print("Harness finished.")
-
           } catch {
-              print("Failed to initialize AVAudioPlayer: \(error.localizedDescription)")
-              exit(1)
+              // Suppress "The operation couldn’t be completed" errors for non-crashing invalid files
           }
           EOF
 
@@ -112,14 +67,6 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '15.4'
-
-      # Compile the C++ corruption utility
-      - name: Compile Corruption Utility
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Compiling encodeme_corruptor..."
-          clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
-          if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
       
       # New Step: Compile the Swift player harness
       - name: Compile Swift Harness
@@ -129,24 +76,67 @@ jobs:
           swiftc harness.swift -o harness
           if [ $? -ne 0 ]; then echo "Swift compilation failed."; exit 1; fi
 
-      # This step now focuses on generating the JSON dump for manual analysis.
-      - name: Generate Atom Dump for Manual Analysis
-        id: generate_dump
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+      # New Step: Build the CoreAudioFuzz utility
+      - name: Build CoreAudioFuzz
+        working-directory: p0tools/CoreAudioFuzz
         run: |
-          set -x 
-          
-          echo "Installing Bento4 to generate an atom dump..."
-          brew install bento4
-          
-          mp4dump --format json IMG_1027.mov > atom_dump.json
+          echo "Building CoreAudioFuzz utility..."
+          make
+          if [ ! -f ./fuzz_af {
+              echo "Fuzzer build failed."
+              exit 1
+          }
+          echo "Fuzzer built successfully."
 
-          echo "Atom dump generated. Please download the 'debug-and-poc-artifacts' artifact to analyze 'atom_dump.json' manually."
-          
-      # Upload just the atom dump for analysis
-      - name: Upload Atom Dump
+      # New Step: Run the fuzzer to generate test cases
+      - name: Generate Fuzzing Test Cases
+        run: |
+          echo "Generating fuzzing corpus..."
+          mkdir -p fuzzing_corpus
+          # Run the fuzzer to generate 100 test case files
+          ./p0tools/CoreAudioFuzz/fuzz_af -max_len=4096 -runs=100 ./fuzzing_corpus/
+          echo "Fuzzing corpus generated."
+          ls -l ./fuzzing_corpus/
+
+      # Final Step: Iterate through the corpus and test each file for a crash
+      - name: Test Fuzzed Files for Crashes
+        run: |
+          echo "Testing all generated files for crashes..."
+          mkdir -p crash_logs
+          for f in fuzzing_corpus/*; do
+            echo "Testing file: $f"
+            LOG_FILE="crash_logs/$(basename $f).log"
+            
+            # Create the lldb script for this iteration
+            cat > player_debug_script.lldb << 'EOF'
+            run
+            bt
+            quit
+            EOF
+
+            # Run the test using our custom harness under lldb
+            lldb -s player_debug_script.lldb -- ./AppleTest2/apple-positional-audio-codec-invalid-header-main/harness "$f" > "$LOG_FILE" 2>&1 || true
+            
+            # Check for a crash signature in the log file
+            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "stop reason = breakpoint" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+              echo "✅✅✅ CRASH DETECTED: $f ✅✅✅"
+              echo "Log saved to: $LOG_FILE"
+              # Optional: Stop on first crash
+              # exit 1 
+            else
+              # Clean up non-crashing logs to save space
+              rm "$LOG_FILE"
+            fi
+          done
+          echo "All files tested."
+
+      # Upload any crashing artifacts
+      - name: Upload Crashing Artifacts
+        if: always() # Always run this step to upload results even if previous steps fail
         uses: actions/upload-artifact@v4
         with:
-          name: debug-artifacts
-          path: AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
+          name: crashing-files-and-logs
+          path: |
+            fuzzing_corpus/
+            crash_logs/
           retention-days: 7
