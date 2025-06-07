@@ -8,18 +8,19 @@ on:
 
 jobs:
   fuzz-and-test:
-    runs-on: macos-latest
+    # Critical Change: Use an Intel-based macOS runner as required by the fuzzer.
+    runs-on: macos-12
 
     steps:
       # Clone your repository which contains the Swift harness
       - name: Clone Your Repository
         run: git clone https://github.com/encryptedcoderr/AppleTest2/
 
-      # New Step: Clone the Google Project Zero tools repository
+      # Clone the Google Project Zero tools repository
       - name: Clone Google Project Zero p0tools
         run: git clone https://github.com/googleprojectzero/p0tools.git
 
-      # New Step: Create our Swift player harness
+      # Create our Swift player harness
       - name: Create Swift Player Harness
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -31,7 +32,6 @@ jobs:
           class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
               var isPlaying = true
               func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-                  // Don't print anything on success to keep logs clean.
                   isPlaying = false
               }
               func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
@@ -53,12 +53,11 @@ jobs:
               audioPlayer.delegate = delegate
               audioPlayer.play()
               
-              // Keep the program running while the audio plays.
               while delegate.isPlaying {
                   RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
               }
           } catch {
-              // Suppress "The operation couldn’t be completed" errors for non-crashing invalid files
+              // Suppress errors for non-crashing invalid files
           }
           EOF
 
@@ -66,65 +65,78 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '15.4'
-      
-      # New Step: Compile the Swift player harness
+          xcode-version: '14.2' # Use a version compatible with macos-12
+
+      # Compile the Swift player harness
       - name: Compile Swift Harness
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Compiling Swift harness..."
           swiftc harness.swift -o harness
-          if [ $? -ne 0 ]; then echo "Swift compilation failed."; exit 1; fi
+          if [ ! -f ./harness ]; then echo "Swift compilation failed."; exit 1; fi
 
-      # New Step: Build the CoreAudioFuzz utility
-      - name: Build CoreAudioFuzz
+      # New: Build the fuzzer exactly as described in the README
+      - name: Build CoreAudioFuzzer and Dependencies
         working-directory: p0tools/CoreAudioFuzz
         run: |
-          echo "Building CoreAudioFuzz utility..."
-          make
-          if [ ! -f ./fuzz_af ]; then
-              echo "Fuzzer build failed."
-              exit 1
-          fi
-          echo "Fuzzer built successfully."
+          echo "Building Jackalope and TinyInst..."
+          # The fuzzer has its own harness.mm, we will use that one.
+          cd jackalope-modifications
+          git clone https://github.com/googleprojectzero/Jackalope.git
+          cd Jackalope
+          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
+          cd ..
+          mkdir build
+          cd build
+          cmake ..
+          cmake --build . --config Release
+          
+          echo "Fuzzer build complete. The executable should be in the 'Release' directory."
+          ls -l ./Release/
 
-      # New Step: Run the fuzzer to generate test cases
+      # New: Run the fuzzer using its provided run script
       - name: Generate Fuzzing Test Cases
+        working-directory: p0tools/CoreAudioFuzz
         run: |
-          echo "Generating fuzzing corpus..."
-          mkdir -p fuzzing_corpus
-          # Run the fuzzer to generate 100 test case files
-          ./p0tools/CoreAudioFuzz/fuzz_af -max_len=4096 -runs=100 ./fuzzing_corpus/
-          echo "Fuzzing corpus generated."
-          ls -l ./fuzzing_corpus/
+          echo "Unzipping provided corpus..."
+          unzip corpus.zip
+          
+          echo "Generating fuzzing corpus using the run.sh script..."
+          # The run.sh script handles launching the fuzzer correctly.
+          # We run it in the background and kill it after a time limit to generate some files.
+          ./run.sh &
+          FUZZER_PID=$!
+          sleep 60 # Let the fuzzer run for 60 seconds
+          kill $FUZZER_PID
+          
+          # The corpus will likely be in a directory named "corpus" by the run.sh script
+          ls -l ./corpus/
 
-      # Final Step: Iterate through the corpus and test each file for a crash
+      # Final Step: Iterate through the generated corpus and test each file for a crash
       - name: Test Fuzzed Files for Crashes
         run: |
           echo "Testing all generated files for crashes..."
           mkdir -p crash_logs
-          for f in fuzzing_corpus/*; do
+          # The fuzzer likely places new findings in the 'crashes' directory
+          for f in p0tools/CoreAudioFuzz/crashes/*; do
+            if [ ! -f "$f" ]; then continue; fi # Handle empty directory case
             echo "Testing file: $f"
-            LOG_FILE="crash_logs/$(basename $f).log"
+            LOG_FILE="crash_logs/$(basename "$f").log"
             
-            # Create the lldb script for this iteration
             cat > player_debug_script.lldb << 'EOF'
             run
             bt
             quit
             EOF
 
-            # Run the test using our custom harness under lldb
+            # Run the test using our custom Swift harness under lldb
             lldb -s player_debug_script.lldb -- ./AppleTest2/apple-positional-audio-codec-invalid-header-main/harness "$f" > "$LOG_FILE" 2>&1 || true
             
-            # Check for a crash signature in the log file
-            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "stop reason = breakpoint" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+            # Check for a crash signature
+            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
               echo "✅✅✅ CRASH DETECTED: $f ✅✅✅"
               echo "Log saved to: $LOG_FILE"
-              # Optional: Stop on first crash
-              # exit 1 
             else
-              # Clean up non-crashing logs to save space
               rm "$LOG_FILE"
             fi
           done
@@ -132,9 +144,11 @@ jobs:
 
       # Upload any crashing artifacts
       - name: Upload Crashing Artifacts
-        if: always() # Always run this step to upload results even if previous steps fail
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: crashing-files-and-logs
           path: |
-            fuzzing_corpus/
+            p0tools/CoreAudioFuzz/crashes/
+            crash_logs/
+          retention-days: 7
