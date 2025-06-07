@@ -43,26 +43,20 @@ jobs:
           }
 
           // Recursive function to find the offset of a nested atom
-          long find_atom_offset(FILE *f, const char* path) {
+          long find_atom_offset(FILE *f, const char* path, long parent_limit) {
               char target_name[5] = {0};
               const char* next_path = NULL;
               const char* separator = strchr(path, '/');
               if (separator) {
-                  strncpy(target_name, path, separator - atom_path);
+                  strncpy(target_name, path, separator - path);
                   next_path = separator + 1;
               } else {
                   strncpy(target_name, path, 4);
               }
 
               long parent_start_offset = ftell(f);
-              // We don't need the whole file size, just the parent's size
-              fseek(f, -8, SEEK_CUR); // Go back to read parent size
-              long parent_size = read_uint32_be(f);
-              fseek(f, 8, SEEK_CUR); // Go back to where we started
-
-              long current_pos = parent_start_offset;
-              while (current_pos < parent_start_offset + parent_size - 8) {
-                  fseek(f, current_pos, SEEK_SET);
+              
+              while (ftell(f) < parent_limit) {
                   long atom_start = ftell(f);
                   uint32_t atom_size = read_uint32_be(f);
                   char atom_name[5] = {0};
@@ -70,12 +64,15 @@ jobs:
 
                   if (compare_fourcc(atom_name, target_name)) {
                       if (next_path) {
-                          return find_atom_offset(f, next_path);
+                          // Pass the new limit for the recursive call
+                          return find_atom_offset(f, next_path, atom_start + atom_size);
                       } else {
                           return atom_start;
                       }
                   }
-                  current_pos += atom_size;
+                  
+                  if (atom_size == 0) break;
+                  fseek(f, atom_start + atom_size, SEEK_SET);
               }
               return -1;
           }
@@ -104,42 +101,11 @@ jobs:
                       return 1;
                   }
                   
-                  // Find the main 'moov' atom
+                  fseek(file, 0, SEEK_END);
+                  long file_size = ftell(file);
                   fseek(file, 0, SEEK_SET);
-                  long moov_offset = find_atom_offset(file, "moov");
-                  if (moov_offset == -1) {
-                      fprintf(stderr, "Could not find 'moov' atom.\n"); return 1;
-                  }
-                  fseek(file, moov_offset + 8, SEEK_SET); // Enter moov
-
-                  // Iterate through 'trak' atoms to find the sound track
-                  long stsd_offset = -1;
-                  while(1) {
-                      long trak_offset = find_atom_offset(file, "trak");
-                      if(trak_offset == -1) break;
-                      fseek(file, trak_offset + 8, SEEK_SET); // Enter trak
-
-                      long mdia_offset = find_atom_offset(file, "mdia");
-                      if(mdia_offset == -1) continue;
-                      fseek(file, mdia_offset + 8, SEEK_SET); // Enter mdia
-
-                      long hdlr_offset = find_atom_offset(file, "hdlr");
-                      if(hdlr_offset == -1) continue;
-                      fseek(file, hdlr_offset + 16, SEEK_SET); // Seek to handler type in hdlr
-                      char handler_type[5] = {0};
-                      fread(handler_type, 1, 4, file);
-
-                      if(compare_fourcc(handler_type, "soun")) {
-                          // This is the audio track, now find stsd within it
-                          fseek(file, mdia_offset + 8, SEEK_SET); // Go back into mdia
-                          long minf_offset = find_atom_offset(file, "minf");
-                          fseek(file, minf_offset + 8, SEEK_SET);
-                          long stbl_offset = find_atom_offset(file, "stbl");
-                          fseek(file, stbl_offset + 8, SEEK_SET);
-                          stsd_offset = find_atom_offset(file, "stsd");
-                          break; // Found it
-                      }
-                  }
+                  
+                  long stsd_offset = find_atom_offset(file, "moov/trak/mdia/minf/stbl/stsd", file_size);
 
                   if (stsd_offset == -1) {
                       fprintf(stderr, "Could not find the audio track's 'stsd' atom.\n");
