@@ -32,9 +32,8 @@ jobs:
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  double sampleRate = 44100.0;
-                  UInt32 channelNum = 2;
-                  NSString *fileName = [NSString stringWithFormat:@"output_invalid.mp3", sampleRate, (unsigned int)channelNum];
+                  // Fixed: Removed unused variables from stringWithFormat to resolve compiler warning.
+                  NSString *fileName = @"output_invalid.mp3";
                   FILE *file = fopen(fileName.UTF8String, "wb");
                   if (!file) {
                       fprintf(stderr, "Failed to create file: %s\n", fileName.UTF8String);
@@ -97,23 +96,23 @@ jobs:
           echo "--- Debugging File Generation Process ---" > $LOG_FILE
           echo "Timestamp: $(date)" >> $LOG_FILE
           
-          echo "Starting LLDB session to inspect the invalid header creation..." >> $LOG_FILE
+          echo "Creating LLDB command script..."
+          # Improved: Create a command script for LLDB for better reliability in CI.
+          # This avoids potential permission issues with direct process attachment/control.
+          cat > debug_script.lldb << 'EOF'
+          breakpoint set --file encodeme.mm --line 29
+          run
+          echo "--- Breakpoint Hit: Inspecting variables before fwrite() ---"
+          p totalFrames
+          p actualFrames
+          p xingHeader
+          continue
+          quit
+          EOF
           
-          # Use LLDB's batch mode to automate the debugging and inspection
-          # 1. Set a breakpoint at the line where the invalid header is written (fwrite)
-          # 2. Run the program
-          # 3. When it stops, print the values of the mismatched frame variables
-          # 4. Print the contents of the header buffer to be written
-          # 5. Continue execution to let the program finish
-          lldb ./encodeme_debug --batch \
-            -o 'breakpoint set --file encodeme.mm --line 34' \
-            -o 'run' \
-            -o 'echo "--- Breakpoint Hit: Inspecting variables before fwrite() ---"' \
-            -o 'p totalFrames' \
-            -o 'p actualFrames' \
-            -o 'p xingHeader' \
-            -o 'continue' \
-            -o 'quit' >> $LOG_FILE 2>&1
+          echo "Starting LLDB session with script to inspect the invalid header creation..." >> $LOG_FILE
+          # Improved: Execute LLDB with the script file.
+          lldb -s debug_script.lldb ./encodeme_debug >> $LOG_FILE 2>&1
             
           echo "✅ Generation debug log created. Displaying contents:"
           cat $LOG_FILE
