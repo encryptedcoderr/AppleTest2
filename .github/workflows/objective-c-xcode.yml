@@ -82,10 +82,10 @@ jobs:
         run: |
           echo "Building CoreAudioFuzz utility..."
           make
-          if [ ! -f ./fuzz_af {
+          if [ ! -f ./fuzz_af ]; then
               echo "Fuzzer build failed."
               exit 1
-          }
+          fi
           echo "Fuzzer built successfully."
 
       # New Step: Run the fuzzer to generate test cases
@@ -138,5 +138,3 @@ jobs:
           name: crashing-files-and-logs
           path: |
             fuzzing_corpus/
-            crash_logs/
-          retention-days: 7
