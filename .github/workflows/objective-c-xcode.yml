@@ -19,7 +19,22 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: This script now parses the MOV to find the exact offset to corrupt.
+      # New Step: Shrink the video file to speed up testing
+      - name: Shrink Base Video File
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          echo "Installing ffmpeg..."
+          brew install ffmpeg
+          echo "Shrinking IMG_1027.mov to the first 5 seconds..."
+          # Use ffmpeg to create a short clip from the large video file.
+          # -i: input file
+          # -t 5: duration of 5 seconds
+          # -c copy: stream copy without re-encoding to preserve the APAC track
+          ffmpeg -i IMG_1027.mov -t 5 -c copy base_small.mov
+          echo "File shrinking complete."
+          ls -lh base_small.mov
+
+      # Updated: This script now parses the smaller MOV to find the exact offset to corrupt.
       - name: Patch encodeme.mm to Surgically Corrupt the APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -60,7 +75,7 @@ jobs:
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting file corruption at %s\n", ctime(&startTime));
 
-                  const char* baseName = "IMG_1027.mov";
+                  const char* baseName = "base_small.mov";
                   const char* pocName = "output_apac_poc.m4a";
 
                   // Step 1: Copy the base file.
