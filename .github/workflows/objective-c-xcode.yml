@@ -10,12 +10,11 @@ jobs:
   stress-test-avplayer:
     runs-on: macos-latest
     
-    # Use a matrix to run different test scenarios in parallel.
-    # This allows for a more organized and scalable testing strategy.
     strategy:
-      fail-fast: false # Don't cancel other jobs if one fails
+      fail-fast: false
       matrix:
-        test_scenario: [ 'offset_fuzz', 'concurrent_playback', 'rapid_start_stop', 'large_file' ]
+        # We are focusing on the two most promising scenarios that are compatible with the runner environment.
+        test_scenario: [ 'offset_fuzz', 'rapid_start_stop' ]
 
     steps:
       # --- SETUP PHASE ---
@@ -60,23 +59,6 @@ jobs:
 
           do {
               switch mode {
-              case "loop":
-                  for i in 0..<50 {
-                      print("Loop \(i+1)/50...")
-                      let player = try AVAudioPlayer(contentsOf: fileURL)
-                      delegate.playingCount = 1
-                      player.delegate = delegate
-                      player.play()
-                      while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05)) }
-                  }
-              case "concurrent":
-                  let players = try (0..<10).map { _ in try AVAudioPlayer(contentsOf: fileURL) }
-                  delegate.playingCount = players.count
-                  players.forEach { player in
-                      player.delegate = delegate
-                      player.play()
-                  }
-                  while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
               case "rapid":
                   let player = try AVAudioPlayer(contentsOf: fileURL)
                   for _ in 0..<500 {
@@ -110,7 +92,7 @@ jobs:
           int main(int argc, const char * argv[]) {
               if (argc != 4) {
                   fprintf(stderr, "Usage: %s <file> <offset> <corruption_mode>\n", argv[0]);
-                  fprintf(stderr, "Modes: tag, random_byte, random_block\n");
+                  fprintf(stderr, "Modes: tag\n");
                   return 1;
               }
 
@@ -126,15 +108,6 @@ jobs:
               if (strcmp(mode, "tag") == 0) {
                   unsigned char tag[4] = {0x01, 0x01, 0x00, 0xFF};
                   fwrite(tag, 1, sizeof(tag), file);
-              } else if (strcmp(mode, "random_byte") == 0) {
-                  srand(time(NULL));
-                  unsigned char byte = rand() % 256;
-                  fwrite(&byte, 1, 1, file);
-              } else if (strcmp(mode, "random_block") == 0) {
-                  srand(time(NULL));
-                  unsigned char block[256];
-                  for(int i=0; i<256; ++i) { block[i] = rand() % 256; }
-                  fwrite(block, 1, sizeof(block), file);
               }
               
               fclose(file);
@@ -167,74 +140,44 @@ jobs:
           echo "### Starting Offset Fuzzing Scenario ###"
           mkdir -p test_results
           # Iterate over a range of offsets around our known target
-          for offset in {3400..3600..20}; do
+          for offset in $(seq 3400 20 3600); do
             echo "--- Testing offset ${offset} ---"
             POC_FILE="output_offset_${offset}.mp4"
             LOG_FILE="test_results/log_offset_${offset}.txt"
             cp IMG_1047.mov "$POC_FILE"
-            ./corruptor "$POC_FILE" $offset "tag"
+            # Calculate the final corruption offset
+            CORRUPTION_OFFSET=$(( ${offset} + 72 ))
+            ./corruptor "$POC_FILE" $CORRUPTION_OFFSET "tag"
             
             lldb -b -o "run" -o "bt" -o "quit" -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
             if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
               echo "✅✅✅ CRASH DETECTED for offset ${offset} ✅✅✅"
+              cat "$LOG_FILE"
             else
               rm "$LOG_FILE" # Clean up non-crashing logs
             fi
           done
-
-      - name: Run Concurrent Playback Test
-        if: matrix.test_scenario == 'concurrent_playback'
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "### Starting Concurrent Playback Scenario ###"
-          POC_FILE="output_concurrent.mp4"
-          LOG_FILE="test_results/log_concurrent.txt"
-          cp IMG_1047.mov "$POC_FILE"
-          # Corrupt at the known-good APAC stsd offset
-          ./corruptor "$POC_FILE" 3533 "tag"
-          
-          # Use ulimit to restrict memory and add stress
-          ulimit -v 500000 
-          lldb -b -o "run" -o "bt" -o "quit" -- ./harness concurrent "$POC_FILE" > "$LOG_FILE" 2>&1 || true
-          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
-            echo "✅✅✅ CRASH DETECTED during concurrent playback ✅✅✅"
-          fi
 
       - name: Run Rapid Start/Stop Test
         if: matrix.test_scenario == 'rapid_start_stop'
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "### Starting Rapid Start/Stop Scenario ###"
+          mkdir -p test_results
           POC_FILE="output_rapid.mp4"
           LOG_FILE="test_results/log_rapid.txt"
           cp IMG_1047.mov "$POC_FILE"
+          # Corrupt at the known-good APAC stsd offset
           ./corruptor "$POC_FILE" 3533 "tag"
           
           lldb -b -o "run" -o "bt" -o "quit" -- ./harness rapid "$POC_FILE" > "$LOG_FILE" 2>&1 || true
           if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
             echo "✅✅✅ CRASH DETECTED during rapid start/stop ✅✅✅"
+            cat "$LOG_FILE"
+          else
+             rm "$LOG_FILE"
           fi
           
-      - name: Run Large File Test
-        if: matrix.test_scenario == 'large_file'
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "### Starting Large File Scenario ###"
-          brew install ffmpeg
-          # Create a large, 1-minute silent video file
-          ffmpeg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t 60 large_base.wav
-          afconvert -d apac -f mp4f large_base.wav large_apac.mp4
-          
-          POC_FILE="output_large_poc.mp4"
-          LOG_FILE="test_results/log_large_file.txt"
-          cp large_apac.mp4 "$POC_FILE"
-          ./corruptor "$POC_FILE" 288 "random_block"
-          
-          lldb -b -o "run" -o "bt" -o "quit" -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
-          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
-            echo "✅✅✅ CRASH DETECTED with large file ✅✅✅"
-          fi
-
       # Upload all artifacts for analysis
       - name: Upload All Artifacts
         if: always()
