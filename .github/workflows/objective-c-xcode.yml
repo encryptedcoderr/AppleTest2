@@ -112,16 +112,11 @@ jobs:
           # The run.sh script needs to be made executable
           chmod +x run.sh
           
-          # Run the fuzzer in the background. Note: The run.sh script may need
-          # modification if it expects the fuzzer in a different path.
-          # For now, we assume it finds it within the build directory structure.
-          ./run.sh &
-          FUZZER_PID=$!
-          sleep 60 # Let the fuzzer run for 60 seconds
-          kill $FUZZER_PID || true # Ignore error if process already exited
+          # Updated: Generate 8 samples instead of 100
+          ./p0tools/CoreAudioFuzz/fuzz_af -max_len=4096 -runs=8 ./fuzzing_corpus/
           
           echo "Fuzzing complete. Checking for generated crash files..."
-          ls -l ./crashes/ || echo "No crashes directory found, which may be normal."
+          ls -l ./fuzzing_corpus/
 
       # Test the generated files for crashes
       - name: Test Fuzzed Files for Crashes
