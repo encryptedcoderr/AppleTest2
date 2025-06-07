@@ -86,9 +86,8 @@ jobs:
           # Step 2: Use mp4dump to create a JSON representation of the file structure.
           mp4dump --format json output_apac_poc.m4a > atom_dump.json
           
-          # Step 3: Use a corrected jq query to parse the JSON and find the offset of the APAC track's 'stsd' atom.
-          # This query finds the 'trak' that contains a child 'hdlr' of type 'soun', then finds the 'stsd' within it.
-          OFFSET=$(jq -r '[.[] | select(.name=="moov") | .children[] | select(.name=="trak" and any(.children[].children[]; .handler_type? == "soun")) | .. | objects | select(.name? == "stsd") | .file_offset][0]' atom_dump.json)
+          # Step 3: Use a corrected, simpler jq query to find the 'stsd' atom that contains the 'apac' codec definition.
+          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
 
           if [ -z "$OFFSET" ]; then
             echo "Could not find audio 'stsd' offset using the corrected jq query. Aborting."
