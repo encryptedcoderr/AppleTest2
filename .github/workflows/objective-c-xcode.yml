@@ -13,15 +13,15 @@ jobs:
     steps:
       # Clone the repository
       - name: Clone repository
-        run: git clone https://github.com/encryptedcoderr/AppleTest/
+        run: git clone https://github.com/encryptedcoderr/AppleTest2/
 
       # Navigate to the correct directory
       - name: Navigate to working directory
-        run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
+        run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
       # Updated: This script now only corrupts a pre-existing valid APAC file.
       - name: Patch encodeme.mm to Corrupt a Pre-existing APAC File
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Patching encodeme.mm to corrupt a pre-existing APAC file..."
           cat > encodeme.mm << 'EOF'
@@ -80,7 +80,7 @@ jobs:
 
       # Compile the corruption utility
       - name: Compile encodeme.mm for Debugging
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Compiling encodeme.mm utility..."
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_corruptor
@@ -88,7 +88,7 @@ jobs:
 
       # This step now just runs the corruption utility.
       - name: Corrupt APAC File
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           # This command will fail if you haven't added the MOV file to your repository.
           ./encodeme_corruptor
@@ -97,7 +97,7 @@ jobs:
           
       # Launch the player directly under LLDB to catch any startup crashes.
       - name: Launch Player Under LLDB to Catch Crash
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
           echo "--- Debugging Audio Player (afplay) with final PoC ---" > $PLAYER_LOG_FILE
@@ -124,7 +124,7 @@ jobs:
         with:
           name: debug-and-poc-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
-            AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
