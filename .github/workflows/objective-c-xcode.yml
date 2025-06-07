@@ -51,7 +51,7 @@ jobs:
                   // This call is expected to fail. We will debug it to find the check.
                   OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
                   if (status != noErr) {
-                      fprintf(stderr, "AudioFileCreateWithURL failed as expected with status: %d ('%c%c%c%c')\n", 
+                      fprintf(stderr, "AudioFileCreateWithURL failed as expected with status: %d ('%c%c%c%c')\n",
                               status, (char)((status>>24)&0xFF), (char)((status>>16)&0xFF), (char)((status>>8)&0xFF), (char)(status&0xFF));
                       return 1;
                   }
@@ -81,17 +81,17 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # New: Use dtrace for high-level tracing of the failing process.
+      # Fixed: Use dtrace to trace system calls made by the process.
       - name: Trace File Generation with dtrace
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           DTRACE_LOG="dtrace_log.txt"
           echo "--- Tracing encodeme_debug with dtrace ---" > $DTRACE_LOG
-          # Use sudo to run dtrace. Trace all function entries (-F) for our specific process.
-          sudo dtrace -F -c ./encodeme_debug >> $DTRACE_LOG 2>&1 || true
+          # This dtrace command will record system calls made by the process.
+          sudo dtrace -p $(pgrep -n encodeme_debug) -n 'syscall:::entry' -c ./encodeme_debug >> $DTRACE_LOG 2>&1 || true
           echo "✅ dtrace log created."
 
-      # New: Use a more advanced LLDB script to step into the failing framework call.
+      # Fixed: Use a corrected and more advanced LLDB script.
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -106,10 +106,10 @@ jobs:
           run
           # We should now be at the very start of the framework function.
           # Let's get a backtrace to confirm our location.
-          echo "\n--- Hit breakpoint at start of AudioFileCreateWithURL ---\n"
+          script print("\n--- Hit breakpoint at start of AudioFileCreateWithURL ---\n")
           bt
           # Now, we will step through the internal functions to find the validation check.
-          echo "\n--- Stepping into framework code... ---\n"
+          script print("\n--- Stepping into framework code... ---\n")
           thread step-in
           bt
           thread step-in
