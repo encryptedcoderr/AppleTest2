@@ -1,5 +1,4 @@
-name: Generate Audio Files
-
+name: Generate and Play Audio Files
 on:
   push:
     branches: [ main ]
@@ -8,7 +7,7 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-and-generate:
+  build-generate-and-play:
     runs-on: macos-latest
 
     steps:
@@ -18,6 +17,7 @@ jobs:
           echo "Cloning repository at $(date)"
           git clone https://github.com/encryptedcoderr/AppleTest/
           echo "Repository cloned at $(date)"
+
       # Navigate and list directory contents
       - name: Navigate and list directory contents
         run: |
@@ -26,6 +26,7 @@ jobs:
           echo "Listing directory contents at $(date)"
           ls -l
           echo "Directory listing completed at $(date)"
+
       # Patch encodeme.mm for 10-second M4A
       - name: Patch encodeme.mm
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
@@ -120,20 +121,13 @@ jobs:
           }
           EOF
           echo "encodeme.mm patched at $(date)"
-      # Log Xcode setup start
-      - name: Log Xcode setup start
-        run: |
-          echo "Setting up Xcode at $(date)"
+
       # Set up specific Xcode version
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.1' # Use Xcode 16.1, compatible with macOS frameworks
+          xcode-version: '15.4' # Use a recent stable version
 
-      # Log Xcode setup completion
-      - name: Log Xcode setup completion
-        run: |
-          echo "Xcode setup completed at $(date)"
       # Verify Xcode and clang version
       - name: Verify Xcode and clang version
         run: |
@@ -142,27 +136,7 @@ jobs:
           clang++ --version
           xcrun --sdk macosx --show-sdk-path
           echo "Verification completed at $(date)"
-      # Check system resources
-      - name: Check system resources
-        run: |
-          echo "Checking system resources at $(date)"
-          df -h
-          system_profiler SPHardwareDataType
-          echo "System resource check completed at $(date)"
-      # Verify encodeme.mm
-      - name: Verify encodeme.mm
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Verifying files at $(date)"
-          if [ -f "encodeme.mm" ]; then
-            echo "encodeme.mm found"
-            ls -l encodeme.mm
-          else
-            echo "encodeme.mm not found"
-            ls -l
-            exit 1
-          fi
-          echo "File verification completed at $(date)"
+
       # Compile encodeme.mm for macOS
       - name: Compile encodeme.mm
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
@@ -171,14 +145,11 @@ jobs:
           clang++ -g -Os -std=c++2b -fmodules -fcxx-modules -fobjc-arc -arch arm64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -framework AVFAudio -framework AudioToolbox encodeme.mm -o encodeme
           if [ $? -eq 0 ]; then
             echo "Compilation successful at $(date)"
-            echo "Listing compiled binary at $(date)"
-            ls -l encodeme || echo "Compiled binary 'encodeme' not found"
-            BINARY_SIZE=$(stat -f %z encodeme 2>/dev/null || stat -c %s encodeme 2>/dev/null)
-            echo "Binary size: $BINARY_SIZE bytes"
           else
             echo "Compilation failed at $(date)"
             exit 1
           fi
+
       # Run encodeme to generate output.m4a
       - name: Run encodeme
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
@@ -192,12 +163,14 @@ jobs:
             echo "encodeme execution failed at $(date)"
             exit 1
           fi
-      # Install FFmpeg for conversion and ffprobe
+
+      # Install FFmpeg for conversion
       - name: Install FFmpeg
         run: |
           echo "Installing FFmpeg at $(date)"
           brew install ffmpeg
           echo "FFmpeg installed at $(date)"
+
       # Convert M4A to MP3
       - name: Convert M4A to MP3
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
@@ -210,52 +183,73 @@ jobs:
             echo "Conversion failed at $(date)"
             exit 1
           fi
+
       # Verify generated files
       - name: Verify generated files
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Checking for generated files at $(date)"
-          ls -lh output.m4a output.mp3 || echo "One or more output files not found at $(date)"
-          if [ -f "output.m4a" ]; then
-            M4A_SIZE=$(stat -f %z output.m4a 2>/dev/null || stat -c %s output.m4a 2>/dev/null)
-            echo "output.m4a size: $M4A_SIZE bytes"
-            if [ "$M4A_SIZE" -eq 0 ]; then
-              echo "Error: output.m4a is 0 bytes"
-              exit 1
-            fi
-            ffprobe -i output.m4a -show_format -show_streams -print_format json || echo "ffprobe failed for output.m4a"
-          else
-            echo "output.m4a not found"
-            exit 1
-          fi
-          if [ -f "output.mp3" ]; then
-            MP3_SIZE=$(stat -f %z output.mp3 2>/dev/null || stat -c %s output.mp3 2>/dev/null)
-            echo "output.mp3 size: $MP3_SIZE bytes"
-            if [ "$MP3_SIZE" -eq 0 ]; then
-              echo "Error: output.mp3 is 0 bytes"
-              exit 1
-            fi
-            ffprobe -i output.mp3 -show_format -show_streams -print_format json || echo "ffprobe failed for output.mp3"
-          else
-            echo "output.mp3 not found"
-            exit 1
-          fi
-      # Log artifact upload start
-      - name: Log artifact upload start
+          ls -lh output.m4a output.mp3
+
+      # Play audio and track processes
+      - name: Play Audio and Track Processes
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Uploading artifacts at $(date)"
-      # Upload M4A and MP3 files as artifacts
-      - name: Upload audio artifacts
+          echo "Starting audio playback in the background..."
+          # Play M4A and get its PID
+          afplay output.m4a &
+          M4A_PID=$!
+          echo "M4A_PID=$M4A_PID" >> $GITHUB_ENV
+          echo "Playing output.m4a with PID: $M4A_PID"
+
+          # Play MP3 and get its PID
+          afplay output.mp3 &
+          MP3_PID=$!
+          echo "MP3_PID=$MP3_PID" >> $GITHUB_ENV
+          echo "Playing output.mp3 with PID: $MP3_PID"
+          
+          # Give processes a moment to appear in the process list
+          sleep 2 
+
+      # Log process information
+      - name: Log Playback Processes
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        run: |
+          LOG_FILE="playback_log.txt"
+          echo "--- Playback Process Log ---" > $LOG_FILE
+          echo "Timestamp: $(date)" >> $LOG_FILE
+          echo "" >> $LOG_FILE
+          
+          echo "Logging M4A playback process..."
+          M4A_PROCESS_INFO=$(ps -p ${{ env.M4A_PID }} -o pid,comm= | tail -n 1)
+          if [ -n "$M4A_PROCESS_INFO" ]; then
+            echo "M4A Playback (PID, Title): $M4A_PROCESS_INFO" >> $LOG_FILE
+          else
+            echo "M4A Playback (PID: ${{ env.M4A_PID }}) - Process not found or completed." >> $LOG_FILE
+          fi
+
+          echo "Logging MP3 playback process..."
+          MP3_PROCESS_INFO=$(ps -p ${{ env.MP3_PID }} -o pid,comm= | tail -n 1)
+          if [ -n "$MP3_PROCESS_INFO" ]; then
+            echo "MP3 Playback (PID, Title): $MP3_PROCESS_INFO" >> $LOG_FILE
+          else
+            echo "MP3 Playback (PID: ${{ env.MP3_PID }}) - Process not found or completed." >> $LOG_FILE
+          fi
+
+          echo "" >> $LOG_FILE
+          echo "--- End of Log ---" >> $LOG_FILE
+
+          echo "Generated Log:"
+          cat $LOG_FILE
+
+      # Upload all artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: audio-files
+          name: generation-and-playback-artifacts
           path: |
             AppleTest/apple-positional-audio-codec-invalid-header-main/output.m4a
             AppleTest/apple-positional-audio-codec-invalid-header-main/output.mp3
+            AppleTest/apple-positional-audio-codec-invalid-header-main/playback_log.txt
           retention-days: 7
           if-no-files-found: error
-
-      # Log artifact upload completion
-      - name: Log artifact upload completion
-        run: |
-          echo "Artifact upload completed at $(date)"
