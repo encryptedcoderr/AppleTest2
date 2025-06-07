@@ -81,17 +81,7 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Fixed: Use a corrected dtrace command to trace function entries.
-      - name: Trace File Generation with dtrace
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          DTRACE_LOG="dtrace_log.txt"
-          echo "--- Tracing encodeme_debug with dtrace ---" > $DTRACE_LOG
-          # This dtrace command will trace all function entries for the target command.
-          sudo dtrace -n 'pid$target:::entry' -c ./encodeme_debug >> $DTRACE_LOG 2>&1 || true
-          echo "✅ dtrace log created."
-
-      # Fixed: Use a corrected and more intelligent LLDB script to step into the relevant code.
+      # Improved: Use a more powerful LLDB script to get a full backtrace at the point of failure.
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -99,20 +89,17 @@ jobs:
           echo "--- Debugging encodeme_debug with LLDB ---" > $LLDB_LOG
           echo "Timestamp: $(date)" >> $LLDB_LOG
           
-          echo "Creating advanced LLDB script..."
+          echo "Creating advanced LLDB script to find the validation function..."
           cat > debug_script.lldb << 'EOF'
-          # Set a breakpoint on the AudioFileCreateWithURL function itself within the framework
-          breakpoint set -n AudioFileCreateWithURL
+          # Set a breakpoint in our code, right AFTER the failing function call.
+          # This ensures the entire framework function has executed.
+          breakpoint set --file encodeme.mm --line 27
           run
-          # We should now be at the very start of the framework function.
-          script print("\n--- Hit breakpoint at start of AudioFileCreateWithURL. Stepping over prologue. ---\n")
-          # Step over the initial assembly instructions (the function prologue)
-          # 'nexti -c 8' will execute 8 instructions.
-          nexti -c 8
-          script print("\n--- Stepped past prologue. Stepping into first internal function call. ---\n")
-          # 'stepi' will step into the first function call after the prologue
-          stepi
-          # Get a backtrace from inside the internal function to identify it
+          # The program will now be stopped right after the error occurred.
+          # This backtrace will show us the full call stack inside AudioToolbox
+          # that led to the error return. This is where we will find the name
+          # of the specific security check function.
+          script print("\n--- Program stopped after failed API call. Capturing final backtrace... ---\n")
           bt
           continue
           quit
@@ -128,7 +115,6 @@ jobs:
         with:
           name: debug-logs
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/dtrace_log.txt
             AppleTest/apple-positional-audio-codec-invalid-header-main/lldb_log.txt
           retention-days: 7
           if-no-files-found: error
