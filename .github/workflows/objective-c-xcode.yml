@@ -118,7 +118,7 @@ jobs:
                       fprintf(stderr, "Failed to re-open file for corruption.\n"); return 1;
                   }
                   
-                  // Find the 'moov' atom
+                  // Find the main 'moov' atom
                   fseek(file, 0, SEEK_END);
                   long file_size = ftell(file);
                   fseek(file, 0, SEEK_SET);
@@ -155,7 +155,7 @@ jobs:
                       fread(handler_type, 1, 4, file);
 
                       if (compare_fourcc(handler_type, "soun")) {
-                          // This is the audio track. Find its stsd.
+                          // This is an audio track. Check if it's the APAC one.
                           fseek(file, mdia_offset + 8, SEEK_SET);
                           long minf_offset = find_child_atom(file, "minf", mdia_offset + mdia_size);
                           fseek(file, minf_offset, SEEK_SET);
@@ -167,18 +167,28 @@ jobs:
                           uint32_t stbl_size = read_uint32_be(file);
 
                           fseek(file, stbl_offset + 8, SEEK_SET);
-                          stsd_offset = find_child_atom(file, "stsd", stbl_offset + stbl_size);
-                          break; // Found it
+                          long current_stsd_offset = find_child_atom(file, "stsd", stbl_offset + stbl_size);
+
+                          // Check inside this stsd for an 'apac' atom
+                          fseek(file, current_stsd_offset + 8, SEEK_SET);
+                          uint32_t stsd_size = read_uint32_be(file); // Read size of stsd
+                          fseek(file, current_stsd_offset + 8, SEEK_SET); // Reset to start of children
+                          long apac_check_offset = find_child_atom(file, "apac", current_stsd_offset + stsd_size);
+
+                          if (apac_check_offset != -1) {
+                            stsd_offset = current_stsd_offset;
+                            break; // Found the APAC sound track
+                          }
                       }
                       trak_search_start = trak_offset + trak_size;
                   }
 
                   if (stsd_offset == -1) {
-                      fprintf(stderr, "Could not find the audio track's 'stsd' atom.\n");
+                      fprintf(stderr, "Could not find the APAC audio track's 'stsd' atom.\n");
                       fclose(file); return 1;
                   }
                   
-                  fprintf(stderr, "Found audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
+                  fprintf(stderr, "Found APAC audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
 
                   // Corrupt the channel layout tag. The offset is relative to the start of the stsd atom.
                   long corruption_offset = stsd_offset + 72;
