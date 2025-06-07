@@ -100,9 +100,9 @@ jobs:
           # Improved: Create a command script for LLDB for better reliability in CI.
           # This avoids potential permission issues with direct process attachment/control.
           cat > debug_script.lldb << 'EOF'
-          breakpoint set --file encodeme.mm --line 29
+          breakpoint set --file encodeme.mm --line 30
           run
-          echo "--- Breakpoint Hit: Inspecting variables before fwrite() ---"
+          script print("--- Breakpoint Hit: Inspecting variables before fwrite() ---")
           p totalFrames
           p actualFrames
           p xingHeader
