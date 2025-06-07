@@ -92,7 +92,8 @@ jobs:
           echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
           
           # Step 2: Use afconvert to extract the APAC stream into a clean M4A file.
-          afconvert -i IMG_1027.mov -o output_apac_clean.m4a -d apac -f mp4f --stream ${APAC_STREAM_INDEX}
+          # The input file is a positional argument, not behind an -i flag.
+          afconvert IMG_1027.mov -o output_apac_clean.m4a -d apac -f mp4f --stream ${APAC_STREAM_INDEX}
 
           if [ $? -ne 0 ]; then
               echo "afconvert failed to create a clean APAC file. This may mean the system version is patched."
