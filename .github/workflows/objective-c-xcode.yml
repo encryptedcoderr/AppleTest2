@@ -54,19 +54,56 @@ jobs:
 
           // Helper function to find the offset of a specific atom (box) in an MP4 file
           long find_atom_offset(FILE *f, const char *atom_name) {
-              long current_offset = 0;
+              // Get total file size for progress calculation
+              fseek(f, 0, SEEK_END);
+              long file_size = ftell(f);
               fseek(f, 0, SEEK_SET);
-              while (!feof(f)) {
+
+              long current_offset = 0;
+              int last_percentage = -1;
+
+              printf("Searching for '%s' atom...\n", atom_name);
+
+              while (1) {
                   current_offset = ftell(f);
+                  
+                  // Progress Bar Logic
+                  if (file_size > 0) {
+                      int percentage = (int)(((double)current_offset / file_size) * 100);
+                      if (percentage > last_percentage) {
+                          last_percentage = percentage;
+                          printf("\r[");
+                          int progress_chars = percentage / 2;
+                          for(int i = 0; i < 50; i++) {
+                              if (i < progress_chars) printf("#");
+                              else printf(" ");
+                          }
+                          printf("] %d%% (%ld/%ld bytes)", percentage, current_offset, file_size);
+                          fflush(stdout);
+                      }
+                  }
+
+                  if (feof(f)) break;
+
                   uint32_t atom_size = read_uint32_be(f);
                   char name[5] = {0};
                   fread(name, 1, 4, f);
+
+                  if (feof(f)) break;
+                  
                   if (strcmp(name, atom_name) == 0) {
+                      printf("\nFound '%s' atom.\n", atom_name);
                       return current_offset;
                   }
-                  if (atom_size == 0) break; // Invalid size
-                  fseek(f, current_offset + atom_size, SEEK_SET);
+                  
+                  if (atom_size == 0) break;
+
+                  if (fseek(f, current_offset + atom_size, SEEK_SET) != 0) {
+                      break; 
+                  }
               }
+              
+              printf("\nAtom '%s' not found.\n", atom_name);
               return -1;
           }
 
