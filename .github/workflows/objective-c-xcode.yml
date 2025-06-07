@@ -8,8 +8,8 @@ on:
 
 jobs:
   fuzz-and-test:
-    # Critical Change: Use an Intel-based macOS runner as required by the fuzzer.
-    runs-on: macos-12
+    # Changed to the latest runner as requested.
+    runs-on: macos-latest
 
     steps:
       # Clone your repository which contains the Swift harness
@@ -65,7 +65,8 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '14.2' # Use a version compatible with macos-12
+          # Updated Xcode version to be compatible with macos-latest
+          xcode-version: '15.4' 
 
       # Compile the Swift player harness
       - name: Compile Swift Harness
