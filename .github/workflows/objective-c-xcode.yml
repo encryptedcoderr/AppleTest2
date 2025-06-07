@@ -47,7 +47,10 @@ jobs:
               // Write a few packets of silent data
               UInt32 numPacketsToWrite = 5;
               UInt32 packetByteSize = 256;
-              char dummy_data[packetByteSize] = {0};
+              
+              // Fixed: Initialize variable-sized arrays using memset instead of an initializer list.
+              char dummy_data[packetByteSize];
+              memset(dummy_data, 0, sizeof(dummy_data));
               
               // Fixed: For variable packet size formats like AAC, we must provide a description
               // for each packet, even if our dummy packets are the same size.
