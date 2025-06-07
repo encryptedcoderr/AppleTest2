@@ -80,12 +80,12 @@ jobs:
           echo "Installing Bento4 and jq to find the correct atom offset..."
           brew install bento4 jq
 
-          # Step 1: Copy the base file to a .mp4 extension
+          # Step 1: Use mp4dump on the original MOV file to create a JSON representation.
+          mp4dump --format json IMG_1027.mov > atom_dump.json
+          
+          # Step 2: Create a copy of the base file that we will corrupt.
           cp IMG_1027.mov output_apac_poc.mp4
-          
-          # Step 2: Use mp4dump to create a JSON representation of the file structure.
-          mp4dump --format json output_apac_poc.mp4 > atom_dump.json
-          
+
           # Step 3: Use a corrected, simpler jq query to find the 'stsd' atom that contains the 'apac' codec definition.
           OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
 
