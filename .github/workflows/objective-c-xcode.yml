@@ -89,7 +89,7 @@ jobs:
           # Step 3: Use a corrected, simpler jq query to find the 'stsd' atom that contains the 'apac' codec definition.
           OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
 
-          if [ -z "$OFFSET" ]; then
+          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
             echo "Could not find audio 'stsd' offset using the corrected jq query. Aborting."
             exit 1
           fi
