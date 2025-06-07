@@ -132,6 +132,12 @@ jobs:
           fi
 
       # --- TEST EXECUTION PHASE ---
+      
+      - name: Start Syslog Monitoring
+        run: |
+          echo "Starting syslog stream..."
+          log stream --predicate 'process == "harness"' --style compact > system_log.txt &
+          echo $! > syslog.pid
 
       - name: Run Offset Fuzzing Test
         if: matrix.test_scenario == 'offset_fuzz'
@@ -149,7 +155,15 @@ jobs:
             CORRUPTION_OFFSET=$(( ${offset} + 72 ))
             ./corruptor "$POC_FILE" $CORRUPTION_OFFSET "tag"
             
-            lldb -b -o "run" -o "bt" -o "quit" -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+            # Enhanced LLDB script for detailed crash info
+            cat > player_debug_script.lldb << 'EOF'
+            run
+            thread backtrace all
+            register read
+            quit
+            EOF
+            
+            lldb -s player_debug_script.lldb -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
             if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
               echo "✅✅✅ CRASH DETECTED for offset ${offset} ✅✅✅"
               cat "$LOG_FILE"
@@ -170,7 +184,15 @@ jobs:
           # Corrupt at the known-good APAC stsd offset
           ./corruptor "$POC_FILE" 3533 "tag"
           
-          lldb -b -o "run" -o "bt" -o "quit" -- ./harness rapid "$POC_FILE" > "$LOG_FILE" 2>&1 || true
+          # Enhanced LLDB script for detailed crash info
+          cat > player_debug_script.lldb << 'EOF'
+          run
+          thread backtrace all
+          register read
+          quit
+          EOF
+          
+          lldb -s player_debug_script.lldb -- ./harness rapid "$POC_FILE" > "$LOG_FILE" 2>&1 || true
           if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
             echo "✅✅✅ CRASH DETECTED during rapid start/stop ✅✅✅"
             cat "$LOG_FILE"
@@ -178,6 +200,14 @@ jobs:
              rm "$LOG_FILE"
           fi
           
+      - name: Stop Syslog Monitoring
+        if: always()
+        run: |
+          echo "Stopping syslog stream..."
+          if [ -f syslog.pid ]; then
+            kill $(cat syslog.pid)
+          fi
+
       # Upload all artifacts for analysis
       - name: Upload All Artifacts
         if: always()
@@ -187,4 +217,5 @@ jobs:
           path: |
             AppleTest2/apple-positional-audio-codec-invalid-header-main/output_*.mp4
             AppleTest2/apple-positional-audio-codec-invalid-header-main/test_results/
+            system_log.txt
           retention-days: 7
