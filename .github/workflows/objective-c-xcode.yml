@@ -81,17 +81,17 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Fixed: Use dtrace to launch and trace the process directly.
+      # Fixed: Use a corrected dtrace command to trace function entries.
       - name: Trace File Generation with dtrace
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           DTRACE_LOG="dtrace_log.txt"
           echo "--- Tracing encodeme_debug with dtrace ---" > $DTRACE_LOG
-          # This dtrace command will record function entries (-f) for our specific process.
-          sudo dtrace -f -c ./encodeme_debug >> $DTRACE_LOG 2>&1 || true
+          # This dtrace command will trace all function entries for the target command.
+          sudo dtrace -n 'pid$target:::entry' -c ./encodeme_debug >> $DTRACE_LOG 2>&1 || true
           echo "✅ dtrace log created."
 
-      # Fixed: Use a more intelligent LLDB script to step into the relevant code.
+      # Fixed: Use a corrected and more intelligent LLDB script to step into the relevant code.
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -107,8 +107,8 @@ jobs:
           # We should now be at the very start of the framework function.
           script print("\n--- Hit breakpoint at start of AudioFileCreateWithURL. Stepping over prologue. ---\n")
           # Step over the initial assembly instructions (the function prologue)
-          # 'nexti 8' will execute 8 instructions.
-          nexti 8
+          # 'nexti -c 8' will execute 8 instructions.
+          nexti -c 8
           script print("\n--- Stepped past prologue. Stepping into first internal function call. ---\n")
           # 'stepi' will step into the first function call after the prologue
           stepi
