@@ -81,7 +81,7 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Improved: Use a more targeted LLDB script to find the exact validation function.
+      # Improved: Use a regular expression to find the mangled C++ symbol name.
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -91,12 +91,11 @@ jobs:
           
           echo "Creating advanced LLDB script to find the validation function..."
           cat > debug_script.lldb << 'EOF'
-          # Set a breakpoint on the internal function that likely performs the format check.
-          # We discovered this function name from the dtrace log in a previous run.
-          # The -S flag sets a breakpoint on a C++ symbol name.
-          breakpoint set -S IsDataFormatSupported
+          # Set a breakpoint using a regular expression to find the correct mangled function name.
+          # The -r flag sets a breakpoint on any C++ symbol that contains "IsDataFormatSupported".
+          breakpoint set -r IsDataFormatSupported
           run
-          # The program will now be stopped inside the validation function.
+          # The program will now be stopped inside the correct validation function.
           # This backtrace will show the exact call stack that leads to the check.
           script print("\n--- Program stopped inside the validation function. Capturing backtrace... ---\n")
           bt
