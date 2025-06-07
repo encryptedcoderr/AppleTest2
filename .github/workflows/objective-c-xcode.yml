@@ -127,7 +127,7 @@ jobs:
                   // Step 2a: Dump the atom structure for debugging
                   fprintf(stderr, "--- Atom Structure Dump ---\n");
                   fseek(file, 0, SEEK_END);
-                  long file_size = ftell(f);
+                  long file_size = ftell(file);
                   fseek(file, 0, SEEK_SET);
                   dump_atoms(file, 0, file_size);
                   fprintf(stderr, "--- End Atom Structure Dump ---\n");
