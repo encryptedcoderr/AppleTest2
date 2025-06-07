@@ -75,17 +75,33 @@ jobs:
       - name: Surgically Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
+          set -x # Print each command before executing it for easier debugging
+          
           echo "Installing AtomicParsley to find the correct atom offset..."
           brew install atomicparsley
 
           # Step 1: Copy the base file.
           cp IMG_1027.mov output_apac_poc.m4a
           
-          # Step 2: Use AtomicParsley to find the offset of the audio track's 'stsd' atom.
-          # We look for the audio track (trak.2) and get the offset of its sample description.
-          # The `grep` and `awk` commands extract the hex offset.
-          OFFSET_STR=$(atomicparsley output_apac_poc.m4a -T 1 | grep "trak.2.mdia.minf.stbl.stsd" | awk '{print $4}')
-          OFFSET=$(echo $OFFSET_STR | tr -d '()')
+          # Step 2: Use AtomicParsley to dynamically find the correct audio track and its 'stsd' atom offset.
+          echo "--- Full AtomicParsley Tree Dump ---"
+          atomicparsley output_apac_poc.m4a -T || echo "AtomicParsley tree dump failed."
+          echo "------------------------------------"
+
+          # First, find the track number of the sound handler ('soun').
+          AUDIO_TRACK_LINE=$(atomicparsley output_apac_poc.m4a -T | grep "hdlr" | grep "'soun'")
+          TRACK_NUM=$(echo "$AUDIO_TRACK_LINE" | awk '{print $1}' | cut -d'.' -f2)
+
+          if [ -z "$TRACK_NUM" ]; then
+            echo "Could not dynamically find the audio track number. Aborting."
+            exit 1
+          fi
+
+          echo "Found audio handler in track number: ${TRACK_NUM}"
+
+          # Now, use the correct track number to find the 'stsd' offset.
+          OFFSET_STR=$(atomicparsley output_apac_poc.m4a -T 1 | grep "trak.${TRACK_NUM}.mdia.minf.stbl.stsd" | awk '{print $4}')
+          OFFSET=$(echo "$OFFSET_STR" | tr -d '()')
 
           if [ -z "$OFFSET" ]; then
             echo "Could not find audio track 'stsd' offset with AtomicParsley. Aborting."
