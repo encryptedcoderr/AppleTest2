@@ -81,7 +81,7 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation -framework AudioToolbox encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # Improved: Use a more powerful LLDB script to get a full backtrace at the point of failure.
+      # Improved: Use a more targeted LLDB script to find the exact validation function.
       - name: Debug File Generation with LLDB
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
@@ -91,15 +91,14 @@ jobs:
           
           echo "Creating advanced LLDB script to find the validation function..."
           cat > debug_script.lldb << 'EOF'
-          # Set a breakpoint in our code, right AFTER the failing function call.
-          # This ensures the entire framework function has executed.
-          breakpoint set --file encodeme.mm --line 27
+          # Set a breakpoint on the internal function that likely performs the format check.
+          # We discovered this function name from the dtrace log in a previous run.
+          # The -S flag sets a breakpoint on a C++ symbol name.
+          breakpoint set -S IsDataFormatSupported
           run
-          # The program will now be stopped right after the error occurred.
-          # This backtrace will show us the full call stack inside AudioToolbox
-          # that led to the error return. This is where we will find the name
-          # of the specific security check function.
-          script print("\n--- Program stopped after failed API call. Capturing final backtrace... ---\n")
+          # The program will now be stopped inside the validation function.
+          # This backtrace will show the exact call stack that leads to the check.
+          script print("\n--- Program stopped inside the validation function. Capturing backtrace... ---\n")
           bt
           continue
           quit
