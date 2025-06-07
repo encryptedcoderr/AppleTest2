@@ -65,8 +65,8 @@ jobs:
       - name: Create C++ Parser and Corruptor
         working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Creating intelligent C++ file parser and corruption utility..."
-          cat > corruptor.cpp << 'EOF'
+          echo "Creating intelligent Objective-C++ file parser and corruption utility..."
+          cat > corruptor.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #include <stdio.h>
           #include <string.h>
@@ -86,7 +86,9 @@ jobs:
           
           // Function to find the offset of a direct child atom within a parent container
           long find_child_atom(FILE* f, const char* target_name, long parent_end_offset) {
-              while (ftell(f) < parent_end_offset) {
+              long current_pos = ftell(f);
+              while (current_pos < parent_end_offset) {
+                  fseek(f, current_pos, SEEK_SET);
                   long atom_start = ftell(f);
                   uint32_t atom_size = read_uint32_be(f);
                   if (atom_size == 0) return -1;
@@ -96,7 +98,7 @@ jobs:
                   if (compare_fourcc(atom_name, target_name)) {
                       return atom_start;
                   }
-                  fseek(f, atom_start + atom_size, SEEK_SET);
+                  current_pos = atom_start + atom_size;
               }
               return -1;
           }
@@ -129,7 +131,7 @@ jobs:
                   // Iterate through tracks inside 'moov'
                   long trak_search_start = moov_offset + 8;
                   long stsd_offset = -1;
-                  while(1) {
+                  while(trak_search_start < moov_offset + moov_size) {
                       fseek(file, trak_search_start, SEEK_SET);
                       long trak_offset = find_child_atom(file, "trak", moov_offset + moov_size);
                       if (trak_offset == -1) break;
@@ -205,7 +207,7 @@ jobs:
           swiftc harness.swift -o harness
           if [ ! -f ./harness ]; then echo "Swift harness compilation failed."; exit 1; fi
           echo "Compiling C++ corruptor..."
-          clang++ -g corruptor.cpp -o corruptor
+          clang++ -g corruptor.mm -o corruptor -framework Foundation
           if [ ! -f ./corruptor ]; then echo "C++ corruptor compilation failed."; exit 1; fi
 
       # Run the new C++ utility to parse and corrupt the file.
