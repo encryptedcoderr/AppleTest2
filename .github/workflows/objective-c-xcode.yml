@@ -45,11 +45,13 @@ jobs:
 
               // Write a few packets of silent data
               UInt32 numPacketsToWrite = 5;
-              char dummy_data[256] = {0};
-              AudioStreamPacketDescription packetDesc = {0};
-              packetDesc.mDataByteSize = sizeof(dummy_data);
+              UInt32 packetByteSize = 256;
+              
+              // Fixed: The buffer must be large enough to hold all the packets we intend to write.
+              char dummy_data[packetByteSize * numPacketsToWrite] = {0};
 
-              status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data) * numPacketsToWrite, &packetDesc, 0, &numPacketsToWrite, dummy_data);
+              // Fixed: For constant-size packets, we pass NULL for the packet descriptions.
+              status = AudioFileWritePackets(audioFile, false, sizeof(dummy_data), NULL, 0, &numPacketsToWrite, dummy_data);
               
               AudioFileClose(audioFile);
               CFRelease(fileURL);
