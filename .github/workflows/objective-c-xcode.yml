@@ -1,9 +1,8 @@
-# This workflow builds and runs a complete fuzzing and tracing toolkit for AWDL/AirDrop.
-# It compiles a BLE fuzzer, creates a session runner script, and executes them
-# to actively probe for vulnerabilities while capturing detailed system logs,
-# kernel events, and raw network traffic.
+# This workflow is now a focused diagnostic tool. It attempts to activate
+# AirDrop and then runs a deep system call trace on all related daemons to
+# understand why the wireless interface is not activating as expected.
 
-name: Build and Run AWDL Fuzzing Session
+name: Build and Run AWDL Diagnostic Trace
 on:
   push:
     branches: [ main ]
@@ -12,121 +11,31 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-and-fuzz:
+  build-and-trace:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Build the BLE Fuzzer utility.
-      - name: Build BLE Fuzzer
+      # Step 1: Create the main session script to orchestrate the diagnostic trace.
+      # The fuzzer is no longer built or run in this version.
+      - name: Create Diagnostic Trace Script
         run: |
-          echo "Creating ble-fuzzer.m source..."
-          cat > ble-fuzzer.m << 'EOF'
-          #import <Foundation/Foundation.h>
-          #import <CoreBluetooth/CoreBluetooth.h>
-
-          typedef NS_ENUM(NSInteger, FuzzStrategy) {
-              FuzzStrategyCorruptLength, FuzzStrategyCorruptType,
-              FuzzStrategyCorruptPayload, FuzzStrategyRandomBytes
-          };
-
-          @interface BLEFuzzer : NSObject <CBPeripheralManagerDelegate>
-          @property (strong, nonatomic) CBPeripheralManager *peripheralManager;
-          @property (strong, nonatomic) NSTimer *fuzzingTimer;
-          @property (assign, nonatomic) FuzzStrategy currentStrategy;
-          @end
-
-          @implementation BLEFuzzer
-          - (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral {
-              if (peripheral.state == CBManagerStatePoweredOn) {
-                  NSLog(@"[Fuzzer] Bluetooth is powered on. Starting fuzzing loop...");
-                  self.fuzzingTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                                                       target:self
-                                                                     selector:@selector(fuzzTick:)
-                                                                     userInfo:nil
-                                                                      repeats:YES];
-              } else {
-                  NSLog(@"[Fuzzer] Bluetooth is not powered on. State: %ld", (long)peripheral.state);
-                  [self.fuzzingTimer invalidate];
-              }
-          }
-
-          - (void)fuzzTick:(NSTimer *)timer {
-              [self.peripheralManager stopAdvertising];
-              self.currentStrategy = (self.currentStrategy + 1) % 4;
-              NSData *fuzzedPayload = [self generateFuzzedPayload];
-              [self.peripheralManager startAdvertising:@{ CBAdvertisementDataManufacturerDataKey: fuzzedPayload }];
-          }
-
-          - (NSData *)generateFuzzedPayload {
-              uint8_t base_data[] = {
-                  0x02, 0x01, 0x06, 0x17, 0xff, 0x4c, 0x00, 0x05, 0x12,
-                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-                  0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc, 0xdd, 0xdd, 0x00
-              };
-              NSMutableData *data = [NSMutableData dataWithBytes:base_data length:sizeof(base_data)];
-              uint8_t *bytes = [data mutableBytes];
-
-              switch (self.currentStrategy) {
-                  case FuzzStrategyCorruptLength:
-                      NSLog(@"[Fuzzer] Strategy: Corrupt Length");
-                      bytes[3] = arc4random_uniform(30);
-                      bytes[9] = arc4random_uniform(20);
-                      break;
-                  case FuzzStrategyCorruptType:
-                      NSLog(@"[Fuzzer] Strategy: Corrupt Type");
-                      bytes[8] = arc4random_uniform(255);
-                      break;
-                  case FuzzStrategyCorruptPayload:
-                      NSLog(@"[Fuzzer] Strategy: Corrupt Payload");
-                      for (int i = 10; i < 27; i++) { bytes[i] = arc4random_uniform(256); }
-                      break;
-                  case FuzzStrategyRandomBytes:
-                      NSLog(@"[Fuzzer] Strategy: Random Bytes");
-                      NSUInteger randomLength = arc4random_uniform(30) + 1;
-                      uint8_t randomBytes[randomLength];
-                      for (int i = 0; i < randomLength; i++) { randomBytes[i] = arc4random_uniform(256); }
-                      return [NSData dataWithBytes:randomBytes length:randomLength];
-              }
-              return data;
-          }
-          @end
-
-          int main(int argc, const char * argv[]) {
-              @autoreleasepool {
-                  BLEFuzzer *fuzzer = [[BLEFuzzer alloc] init];
-                  fuzzer.peripheralManager = [[CBPeripheralManager alloc] initWithDelegate:fuzzer queue:nil];
-                  NSLog(@"[Fuzzer] Initialized. Press Ctrl+C to stop.");
-                  [[NSRunLoop currentRunLoop] run];
-              }
-              return 0;
-          }
-          EOF
-          clang -fobjc-arc -framework Foundation -framework CoreBluetooth ble-fuzzer.m -o ble-fuzzer
-          echo "✅ BLE Fuzzer compiled."
-
-      # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
-      - name: Create Fuzzing Session Script
-        run: |
-          echo "Creating run_fuzz_session.sh script..."
-          cat > run_fuzz_session.sh << 'EOF'
+          echo "Creating run_trace_session.sh script..."
+          cat > run_trace_session.sh << 'EOF'
           #!/bin/bash
           if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
 
-          LOG_DIR="fuzz_trace_logs"
+          LOG_DIR="diagnostic_trace_logs"
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
+          echo "--- Diagnostic Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # --- ACTIVATION AND DYNAMIC INTERFACE DISCOVERY ---
-          echo "[*] Activating AirDrop and discovering wireless interface..."
+          # --- ACTIVATION AND TRACING LOGIC ---
+          echo "[*] Attempting to activate AirDrop and tracing system response..."
 
           # 1. Store the original AirDrop discoverability mode.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
 
-          # 2. Get a snapshot of interfaces *before* activation.
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
-
-          # 3. Set AirDrop to Everyone and VERIFY the change.
+          # 2. Set AirDrop to Everyone and VERIFY the change.
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
           NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
           if [ "$NEW_MODE" != "Everyone" ]; then
@@ -135,67 +44,45 @@ jobs:
           fi
           echo "    Verified AirDrop mode is set to 'Everyone'."
           
+          # 3. Get a snapshot of interfaces *before* daemon restart.
+          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
+          
           # 4. Force restart all related daemons to ensure settings are reloaded.
+          echo "[*] Restarting sharingd, nearbyd, and rapportd to apply new settings..."
           sudo pkill sharingd nearbyd rapportd || true
-          echo "    Restarted sharing, nearby, and rapport daemons."
           sleep 5
 
-          # Start the BLE fuzzer in the background
-          echo "[*] Starting BLE fuzzer to stimulate interface creation..."
-          sudo ./ble-fuzzer > $LOG_DIR/fuzzer.log 2>&1 &
-          FUZZER_PID=$!
-          echo "    Fuzzer running with PID $FUZZER_PID."
-
-          # 5. Wait for a new, active interface to appear.
-          TARGET_INTERFACE=""
-          echo "[*] Probing for new network interface..."
-          for i in {1..6}; do
-              ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
-              NEW_INTERFACE_CANDIDATE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
-              
-              if [ -n "$NEW_INTERFACE_CANDIDATE" ] && ifconfig "$NEW_INTERFACE_CANDIDATE" 2>/dev/null | grep -q "status: active"; then
-                  TARGET_INTERFACE=$NEW_INTERFACE_CANDIDATE
-                  echo "✅ Discovered active AirDrop interface: $TARGET_INTERFACE"
-                  break
-              fi
-              echo "    No new interface found yet... (Attempt $i/6)"
-              sleep 5
-          done
-
-          if [ -z "$TARGET_INTERFACE" ]; then
-              echo "❌ Timed out discovering a new AirDrop interface."
-              sudo kill $FUZZER_PID
-              sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE" && sudo pkill sharingd
-              exit 1
-          fi
-          # --- END DISCOVERY LOGIC ---
-
-          # Start tracers now that the interface is active
-          echo "[*] Starting tracers on interface '$TARGET_INTERFACE' for 60 seconds..."
-          echo '#!/usr/sbin/dtrace -s\n\nfbt:kernel:awdl*:entry { printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\\n", pid, execname, probemod, probefunc); }' > dlistener.d
-          chmod +x dlistener.d
-          sudo ./dlistener.d > $LOG_DIR/dtrace.log 2>&1 &
-          DTRACE_PID=$!
-
-          sudo tcpdump -i $TARGET_INTERFACE -w $LOG_DIR/awdl_capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
-          TCPDUMP_PID=$!
-
-          # Trace all relevant daemons
-          PIDS=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS" ]; then
-              for pid in $PIDS; do
-                  sudo fs_usage -w -f network pid $pid > "$LOG_DIR/fs_usage_$pid.log" 2>&1 &
+          # 5. Start tracing all relevant daemons using dtruss for comprehensive syscall logging.
+          echo "[*] Starting system call trace for 90 seconds..."
+          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          if [ -n "$PIDS_TO_TRACE" ]; then
+              for pid in $PIDS_TO_TRACE; do
+                  PROC_NAME=$(ps -p $pid -o comm=)
+                  echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
+                  sudo dtruss -p $pid -f -o "$LOG_DIR/dtruss_$PROC_NAME_$pid.log" &
               done
+          else
+              echo "⚠️ Could not find any target daemons to trace."
           fi
 
-          sleep 60
+          sleep 90
 
-          echo "[*] Stopping fuzzer and all tracers..."
-          sudo kill $FUZZER_PID $DTRACE_PID $TCPDUMP_PID || true
-          if [ -n "$PIDS" ]; then
-              for pid in $PIDS; do sudo pkill -f "fs_usage.*pid $pid" || true; done
-          fi
+          echo "[*] Stopping all tracers..."
+          sudo pkill dtruss || true
           
+          # --- DYNAMIC INTERFACE DISCOVERY ---
+          echo "[*] Checking for new network interfaces after trace..."
+          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
+          NEW_INTERFACE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
+
+          if [ -n "$NEW_INTERFACE" ]; then
+              echo "✅ A new interface was discovered during the trace: $NEW_INTERFACE"
+              ifconfig "$NEW_INTERFACE" > "$LOG_DIR/new_interface_details.txt"
+          else
+              echo "❌ No new network interface was created."
+          fi
+          # --- END DISCOVERY ---
+
           # --- CLEANUP LOGIC ---
           echo "[*] Restoring original AirDrop settings..."
           sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
@@ -203,20 +90,20 @@ jobs:
           echo "    Restored AirDrop mode to '$ORIGINAL_MODE' and restarted sharingd."
           # --- END CLEANUP LOGIC ---
 
-          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
+          echo "✅ Diagnostic trace complete. Logs are in '$LOG_DIR'."
           ls -l $LOG_DIR
           EOF
-          chmod +x run_fuzz_session.sh
+          chmod +x run_trace_session.sh
 
-      # Step 3: Execute the fuzzing session.
-      - name: Run Fuzzing and Tracing Session
-        run: sudo ./run_fuzz_session.sh
+      # Step 2: Execute the diagnostic session.
+      - name: Run Diagnostic Tracing Session
+        run: sudo ./run_trace_session.sh
 
-      # Step 4: Upload all captured logs as an artifact for analysis.
-      - name: Upload Fuzzing Artifacts
+      # Step 3: Upload all captured logs as an artifact for analysis.
+      - name: Upload Diagnostic Artifacts
         if: always() # Ensure logs are uploaded even if a step fails
         uses: actions/upload-artifact@v4
         with:
-          name: awdl-fuzzing-logs
-          path: fuzz_trace_logs/
+          name: awdl-diagnostic-logs
+          path: diagnostic_trace_logs/
           retention-days: 7
