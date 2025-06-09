@@ -1,4 +1,4 @@
-# This workflow is now a focused diagnostic tool. It attempts to activate
+# This workflow is a focused diagnostic tool. It attempts to activate
 # AirDrop and then runs a deep system call trace on all related daemons to
 # understand why the wireless interface is not activating as expected.
 
@@ -16,7 +16,6 @@ jobs:
 
     steps:
       # Step 1: Create the main session script to orchestrate the diagnostic trace.
-      # The fuzzer is no longer built or run in this version.
       - name: Create Diagnostic Trace Script
         run: |
           echo "Creating run_trace_session.sh script..."
@@ -29,57 +28,43 @@ jobs:
           echo "--- Diagnostic Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
           # --- ACTIVATION AND TRACING LOGIC ---
-          echo "[*] Attempting to activate AirDrop and tracing system response..."
+          echo "[*] Starting system-wide trace and then activating AirDrop..."
 
-          # 1. Store the original AirDrop discoverability mode.
+          # 1. Start tracing the parent process (launchd) BEFORE activation.
+          # The -f flag will ensure we trace any child processes it spawns,
+          # such as when sharingd and others are restarted.
+          echo "[*] Starting dtruss to trace all relevant daemon activity..."
+          # Note: We are now tracing the creation of the processes themselves.
+          sudo dtruss -f -o $LOG_DIR/full_system_trace.log -n launchd &
+          DTRUSS_PID=$!
+          sleep 2 # Give dtruss a moment to attach.
+
+          # 2. Store the original AirDrop discoverability mode.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
 
-          # 2. Set AirDrop to Everyone and VERIFY the change.
+          # 3. Set AirDrop to Everyone.
+          echo "[*] Setting AirDrop mode to 'Everyone'..."
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
-          NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
-          if [ "$NEW_MODE" != "Everyone" ]; then
-              echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
-              exit 1
-          fi
-          echo "    Verified AirDrop mode is set to 'Everyone'."
           
-          # 3. Get a snapshot of interfaces *before* daemon restart.
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
-          
-          # 4. Force restart all related daemons to ensure settings are reloaded.
+          # 4. Force restart all related daemons to apply the new settings.
           echo "[*] Restarting sharingd, nearbyd, and rapportd to apply new settings..."
           sudo pkill sharingd nearbyd rapportd || true
-          sleep 5
-
-          # 5. Start tracing all relevant daemons using dtruss for comprehensive syscall logging.
-          echo "[*] Starting system call trace for 90 seconds..."
-          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS_TO_TRACE" ]; then
-              for pid in $PIDS_TO_TRACE; do
-                  PROC_NAME=$(ps -p $pid -o comm=)
-                  echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -o "$LOG_DIR/dtruss_$PROC_NAME_$pid.log" &
-              done
-          else
-              echo "⚠️ Could not find any target daemons to trace."
-          fi
-
+          
+          # 5. Let the trace run for an extended period to capture all activity.
+          echo "[*] Tracing system for 90 seconds to capture the full activation sequence..."
           sleep 90
 
-          echo "[*] Stopping all tracers..."
-          sudo pkill dtruss || true
+          echo "[*] Stopping tracers..."
+          sudo kill $DTRUSS_PID || true
           
           # --- DYNAMIC INTERFACE DISCOVERY ---
-          echo "[*] Checking for new network interfaces after trace..."
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
-          NEW_INTERFACE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
-
-          if [ -n "$NEW_INTERFACE" ]; then
-              echo "✅ A new interface was discovered during the trace: $NEW_INTERFACE"
-              ifconfig "$NEW_INTERFACE" > "$LOG_DIR/new_interface_details.txt"
+          echo "[*] Checking for network interfaces..."
+          ifconfig -a > $LOG_DIR/ifconfig_final.txt
+          if grep -q "awdl0" $LOG_DIR/ifconfig_final.txt || grep -q "llw0" $LOG_DIR/ifconfig_final.txt; then
+              echo "✅ A peer-to-peer interface (awdl0 or llw0) was found."
           else
-              echo "❌ No new network interface was created."
+              echo "❌ No new peer-to-peer network interface was created."
           fi
           # --- END DISCOVERY ---
 
