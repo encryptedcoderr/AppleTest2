@@ -116,20 +116,29 @@ jobs:
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
           echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # --- DYNAMIC INTERFACE DISCOVERY LOGIC ---
+          # --- ACTIVATION AND DYNAMIC INTERFACE DISCOVERY ---
           echo "[*] Activating AirDrop and discovering wireless interface..."
 
-          # 1. Get a snapshot of interfaces *before* activation.
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
-
-          # 2. Store the original AirDrop discoverability mode and set to Everyone.
+          # 1. Store the original AirDrop discoverability mode.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
+
+          # 2. Get a snapshot of interfaces *before* activation.
+          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
+
+          # 3. Set AirDrop to Everyone and VERIFY the change.
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
+          NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
+          if [ "$NEW_MODE" != "Everyone" ]; then
+              echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
+              exit 1
+          fi
+          echo "    Verified AirDrop mode is set to 'Everyone'."
           
-          # 3. Restart sharingd to apply the new settings.
-          sudo pkill sharingd && echo "    Restarted sharingd daemon."
-          sleep 5 # Give the daemon time to restart properly.
+          # 4. Force restart all related daemons to ensure settings are reloaded.
+          sudo pkill sharingd nearbyd rapportd || true
+          echo "    Restarted sharing, nearby, and rapport daemons."
+          sleep 5
 
           # Start the BLE fuzzer in the background
           echo "[*] Starting BLE fuzzer to stimulate interface creation..."
@@ -137,18 +146,16 @@ jobs:
           FUZZER_PID=$!
           echo "    Fuzzer running with PID $FUZZER_PID."
 
-          # 4. Wait for a new, active interface to appear.
+          # 5. Wait for a new, active interface to appear.
           TARGET_INTERFACE=""
           echo "[*] Probing for new network interface..."
           for i in {1..6}; do
               ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
-              # Find an interface name that is in 'after' but not 'before'.
               NEW_INTERFACE_CANDIDATE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
               
-              if [ -n "$NEW_INTERFACE_CANDIDATE" ]; then
-                  # We found a new interface. Let's assume it's the right one.
+              if [ -n "$NEW_INTERFACE_CANDIDATE" ] && ifconfig "$NEW_INTERFACE_CANDIDATE" 2>/dev/null | grep -q "status: active"; then
                   TARGET_INTERFACE=$NEW_INTERFACE_CANDIDATE
-                  echo "✅ Discovered new interface: $TARGET_INTERFACE"
+                  echo "✅ Discovered active AirDrop interface: $TARGET_INTERFACE"
                   break
               fi
               echo "    No new interface found yet... (Attempt $i/6)"
