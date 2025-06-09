@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Discover network interfaces and key processes. This step is unchanged.
+      # Step 1: Discover network interfaces and key processes.
       - name: Discover Interfaces and Related Daemons
         id: discovery
         run: |
@@ -31,44 +31,59 @@ jobs:
             echo "❌ No key daemons were running."
           fi
 
-      # Step 2: Create a syntactically correct DTrace listener.
-      # The comments have been changed from '#' to '//' to fix the compilation error.
-      - name: Create Corrected AWDL DTrace Listener
+      # Step 2: Create and compile a utility to programmatically trigger AWDL.
+      # This tool uses the CoreWLAN framework to force the creation of the awdl0 interface.
+      - name: Build AWDL Activator Utility
         run: |
-          echo "Creating corrected DTrace script..."
-          cat > dlistener.d << 'EOF'
-          #!/usr/sbin/dtrace -s
+          echo "Creating AWDL Activator source..."
+          cat > activator.m << 'EOF'
+          #import <Foundation/Foundation.h>
+          #import <CoreWLAN/CoreWLAN.h>
 
-          // This script traces all AWDL kernel functions to capture a broad range of events.
-          // NOTE: This may require System Integrity Protection (SIP) to be at least partially
-          // disabled for full visibility.
-
-          fbt:kernel:awdl*:entry
-          {
-            printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\n", pid, execname, probemod, probefunc);
+          int main(int argc, const char * argv[]) {
+              @autoreleasepool {
+                  NSLog(@"[Activator] Starting CoreWLAN scan to stimulate wireless stack...");
+                  CWInterface *wifiInterface = [CWInterface interface];
+                  if (!wifiInterface) {
+                      NSLog(@"[Activator] Error: Could not get a Wi-Fi interface.");
+                      return 1;
+                  }
+                  NSError *err = nil;
+                  // A network scan is a reliable way to wake up the wireless stack and
+                  // trigger the creation of associated interfaces like awdl0.
+                  [wifiInterface scanForNetworksWithName:nil error:&err];
+                  if (err) {
+                      NSLog(@"[Activator] Scan failed with error: %@", err);
+                      return 1;
+                  }
+                  NSLog(@"[Activator] Scan command issued successfully.");
+              }
+              return 0;
           }
           EOF
-          chmod +x dlistener.d
-          echo "✅ DTrace script created."
+          echo "Compiling activator utility..."
+          clang -fobjc-arc -framework Foundation -framework CoreWLAN activator.m -o activator
+          echo "✅ Activator utility compiled."
 
       # Step 3: Proactively activate the awdl0 interface and wait until it is ready.
-      # This new, robust step solves the race condition that caused tcpdump to fail.
+      # This new, robust step runs the activator and then waits for the interface to appear.
       - name: Activate and Verify awdl0 Interface
         run: |
           echo "Attempting to activate and verify the awdl0 interface..."
-          # Loop for up to 20 seconds, trying to bring the interface up.
-          for i in {1..4}; do
-            sudo ifconfig awdl0 up
-            # Check if the interface is now up and running.
-            if ifconfig awdl0 | grep -q "status: active"; then
+          # Loop for up to 30 seconds, running our activator and checking for the interface.
+          for i in {1..6}; do
+            # Run the activator to poke the wireless daemon.
+            ./activator
+            # Check if the interface now exists and is active.
+            if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
               echo "✅ awdl0 interface is now active."
               exit 0
             fi
-            echo "Waiting for awdl0 to become active... (Attempt $i/4)"
+            echo "Waiting for awdl0 to be created and become active... (Attempt $i/6)"
             sleep 5
           done
-          echo "❌ Error: Timed out waiting for awdl0 interface to become active."
-          ifconfig awdl0
+          echo "❌ Error: Timed out waiting for awdl0 interface."
+          ifconfig -a
           exit 1
 
       # Step 4: Run Tracers and Packet Capture on the now-active interface.
@@ -79,13 +94,15 @@ jobs:
           LOG_DIR="trace_logs"
           mkdir -p $LOG_DIR
 
-          # Run dtrace listener
+          # Create and start the DTrace listener
+          echo '#!/usr/sbin/dtrace -s\n\nfbt:kernel:awdl*:entry { printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\\n", pid, execname, probemod, probefunc); }' > dlistener.d
+          chmod +x dlistener.d
           echo "--- DTrace Log ---" > $LOG_DIR/dtrace.log
           sudo ./dlistener.d >> $LOG_DIR/dtrace.log 2>&1 &
           DTRACE_PID=$!
           echo "dtrace listener started with PID $DTRACE_PID."
 
-          # Run tcpdump to capture raw AWDL packets. This should now succeed.
+          # Run tcpdump to capture raw AWDL packets.
           echo "--- Packet Capture Log ---" > $LOG_DIR/awdl_capture.pcap
           sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap >> $LOG_DIR/tcpdump.log 2>&1 &
           TCPDUMP_PID=$!
@@ -115,14 +132,14 @@ jobs:
           echo "Tracers stopped."
 
 
-      # Step 5: Capture a snapshot of open files and network connections. Unchanged.
+      # Step 5: Capture a snapshot of open files and network connections.
       - name: Snapshot Open Network Sockets
         run: |
           echo "--- lsof Network Log ---" > trace_logs/lsof_output.log
           sudo lsof -i -n -P >> trace_logs/lsof_output.log 2>&1
 
 
-      # Step 6: Upload all captured logs as an artifact. Unchanged.
+      # Step 6: Upload all captured logs as an artifact.
       - name: Upload Trace Artifacts
         uses: actions/upload-artifact@v4
         with:
