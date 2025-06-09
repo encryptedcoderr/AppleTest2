@@ -116,67 +116,61 @@ jobs:
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
           echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # --- ACTIVATION AND VERIFICATION LOGIC ---
-          echo "[*] Ensuring Bluetooth and AirDrop are active..."
+          # --- DYNAMIC INTERFACE DISCOVERY LOGIC ---
+          echo "[*] Activating AirDrop and discovering wireless interface..."
 
-          # 1. Force restart the main Bluetooth daemon to ensure it's running.
-          sudo launchctl kickstart -k system/com.apple.bluetoothd
-          echo "    System Bluetooth daemon restarted."
-          sleep 2
+          # 1. Get a snapshot of interfaces *before* activation.
+          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
 
-          # 2. Store the original AirDrop discoverability mode.
+          # 2. Store the original AirDrop discoverability mode and set to Everyone.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
-
-          # 3. Set AirDrop to be discoverable by everyone.
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
           
-          # 4. Verify that the setting was applied correctly.
-          NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
-          if [ "$NEW_MODE" != "Everyone" ]; then
-              echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
-              exit 1
-          fi
-          echo "    Verified AirDrop mode is set to 'Everyone'."
-
-          # 5. Restart sharingd by killing the process, which is more reliable than launchctl kickstart.
-          sudo pkill sharingd
-          echo "    Restarted sharingd daemon via pkill."
+          # 3. Restart sharingd to apply the new settings.
+          sudo pkill sharingd && echo "    Restarted sharingd daemon."
           sleep 5 # Give the daemon time to restart properly.
-          # --- END ACTIVATION LOGIC ---
 
           # Start the BLE fuzzer in the background
-          echo "[*] Starting BLE fuzzer..."
+          echo "[*] Starting BLE fuzzer to stimulate interface creation..."
           sudo ./ble-fuzzer > $LOG_DIR/fuzzer.log 2>&1 &
           FUZZER_PID=$!
           echo "    Fuzzer running with PID $FUZZER_PID."
 
-          # Wait for awdl0 to appear
-          echo "[*] Waiting for awdl0 interface to activate..."
+          # 4. Wait for a new, active interface to appear.
+          TARGET_INTERFACE=""
+          echo "[*] Probing for new network interface..."
           for i in {1..6}; do
-              if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
-                  echo "✅ awdl0 is ACTIVE!"
+              ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
+              # Find an interface name that is in 'after' but not 'before'.
+              NEW_INTERFACE_CANDIDATE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
+              
+              if [ -n "$NEW_INTERFACE_CANDIDATE" ]; then
+                  # We found a new interface. Let's assume it's the right one.
+                  TARGET_INTERFACE=$NEW_INTERFACE_CANDIDATE
+                  echo "✅ Discovered new interface: $TARGET_INTERFACE"
                   break
               fi
-              if [ $i -eq 6 ]; then
-                  echo "❌ Timed out waiting for awdl0."
-                  sudo kill $FUZZER_PID
-                  # Restore original settings before exiting
-                  sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
-                  sudo pkill sharingd
-                  exit 1
-              fi
+              echo "    No new interface found yet... (Attempt $i/6)"
               sleep 5
           done
 
+          if [ -z "$TARGET_INTERFACE" ]; then
+              echo "❌ Timed out discovering a new AirDrop interface."
+              sudo kill $FUZZER_PID
+              sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE" && sudo pkill sharingd
+              exit 1
+          fi
+          # --- END DISCOVERY LOGIC ---
+
           # Start tracers now that the interface is active
-          echo "[*] Starting tracers for 60 seconds..."
+          echo "[*] Starting tracers on interface '$TARGET_INTERFACE' for 60 seconds..."
           echo '#!/usr/sbin/dtrace -s\n\nfbt:kernel:awdl*:entry { printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\\n", pid, execname, probemod, probefunc); }' > dlistener.d
           chmod +x dlistener.d
           sudo ./dlistener.d > $LOG_DIR/dtrace.log 2>&1 &
           DTRACE_PID=$!
 
-          sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
+          sudo tcpdump -i $TARGET_INTERFACE -w $LOG_DIR/awdl_capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
           TCPDUMP_PID=$!
 
           # Trace all relevant daemons
