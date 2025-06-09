@@ -116,6 +116,22 @@ jobs:
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
           echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
+          # --- NEW ACTIVATION LOGIC ---
+          echo "[*] Activating AirDrop to stimulate awdl0 interface..."
+          # Store the original AirDrop discoverability mode to restore it later.
+          ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
+          echo "    Original AirDrop mode: $ORIGINAL_MODE"
+
+          # Set AirDrop to be discoverable by everyone to force stack activation.
+          sudo defaults write com.apple.sharingd DiscoverableMode Everyone
+          echo "    Set AirDrop mode to 'Everyone'."
+
+          # Restart sharingd to apply the new settings.
+          sudo pkill sharingd
+          echo "    Restarted sharingd daemon."
+          sleep 5 # Give the daemon time to restart properly.
+          # --- END NEW ACTIVATION LOGIC ---
+
           # Start the BLE fuzzer in the background
           echo "[*] Starting BLE fuzzer..."
           sudo ./ble-fuzzer > $LOG_DIR/fuzzer.log 2>&1 &
@@ -163,6 +179,13 @@ jobs:
               for pid in $PIDS; do sudo pkill -f "fs_usage.*pid $pid" || true; done
           fi
           
+          # --- NEW CLEANUP LOGIC ---
+          echo "[*] Restoring original AirDrop settings..."
+          sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
+          sudo pkill sharingd
+          echo "    Restored AirDrop mode to '$ORIGINAL_MODE' and restarted sharingd."
+          # --- END NEW CLEANUP LOGIC ---
+
           echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
           ls -l $LOG_DIR
           EOF
