@@ -139,9 +139,9 @@ jobs:
           fi
           echo "    Verified AirDrop mode is set to 'Everyone'."
 
-          # 5. Restart sharingd to apply the new settings.
-          sudo launchctl kickstart -k system/com.apple.sharingd
-          echo "    Restarted sharingd daemon."
+          # 5. Restart sharingd by killing the process, which is more reliable than launchctl kickstart.
+          sudo pkill sharingd
+          echo "    Restarted sharingd daemon via pkill."
           sleep 5 # Give the daemon time to restart properly.
           # --- END ACTIVATION LOGIC ---
 
@@ -163,7 +163,7 @@ jobs:
                   sudo kill $FUZZER_PID
                   # Restore original settings before exiting
                   sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
-                  sudo launchctl kickstart -k system/com.apple.sharingd
+                  sudo pkill sharingd
                   exit 1
               fi
               sleep 5
@@ -198,7 +198,7 @@ jobs:
           # --- CLEANUP LOGIC ---
           echo "[*] Restoring original AirDrop settings..."
           sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
-          sudo launchctl kickstart -k system/com.apple.sharingd
+          sudo pkill sharingd
           echo "    Restored AirDrop mode to '$ORIGINAL_MODE' and restarted sharingd."
           # --- END CLEANUP LOGIC ---
 
