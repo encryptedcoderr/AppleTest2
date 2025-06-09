@@ -32,10 +32,10 @@ jobs:
           fi
 
       # Step 2: Create and compile a utility to programmatically trigger AWDL.
-      # This tool uses the CoreWLAN framework to force the creation of the awdl0 interface.
+      # This tool uses the modern CoreWLAN framework API to force the creation of the awdl0 interface.
       - name: Build AWDL Activator Utility
         run: |
-          echo "Creating AWDL Activator source..."
+          echo "Creating AWDL Activator source with modern API..."
           cat > activator.m << 'EOF'
           #import <Foundation/Foundation.h>
           #import <CoreWLAN/CoreWLAN.h>
@@ -43,16 +43,17 @@ jobs:
           int main(int argc, const char * argv[]) {
               @autoreleasepool {
                   NSLog(@"[Activator] Starting CoreWLAN scan to stimulate wireless stack...");
-                  CWInterface *wifiInterface = [CWInterface interface];
+                  // Use the modern, correct API to get the shared Wi-Fi client and its interface.
+                  CWInterface *wifiInterface = [CWWiFiClient sharedWiFiClient].interface;
                   if (!wifiInterface) {
-                      NSLog(@"[Activator] Error: Could not get a Wi-Fi interface.");
+                      NSLog(@"[Activator] Error: Could not get a Wi-Fi interface using [CWWiFiClient sharedWiFiClient].interface.");
                       return 1;
                   }
                   NSError *err = nil;
                   // A network scan is a reliable way to wake up the wireless stack and
                   // trigger the creation of associated interfaces like awdl0.
-                  [wifiInterface scanForNetworksWithName:nil error:&err];
-                  if (err) {
+                  BOOL success = [wifiInterface scanForNetworksWithName:nil error:&err];
+                  if (!success || err) {
                       NSLog(@"[Activator] Scan failed with error: %@", err);
                       return 1;
                   }
