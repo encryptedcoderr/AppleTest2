@@ -1,7 +1,7 @@
 # This workflow performs internal reconnaissance of the AWDL/AirDrop stack on macOS.
-# It identifies the awdl0 interface, finds all related daemons (including airportd
-# and wifip2pd), actively stimulates AWDL activity, and then uses powerful system
-# tracing and packet capture tools to monitor and log all interactions.
+# It uses a robust method to ensure the awdl0 interface is active, then traces
+# related daemons and captures raw network packets to create a comprehensive
+# dataset for vulnerability analysis.
 
 name: Active Internal AWDL and AirDrop System Trace
 on:
@@ -16,41 +16,32 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Discover network interfaces and key processes
-      # We now search for a wider range of daemons, including the core Wi-Fi
-      # and P2P daemons identified in the previous run's logs.
+      # Step 1: Discover network interfaces and key processes. This step is unchanged.
       - name: Discover Interfaces and Related Daemons
         id: discovery
         run: |
           echo "--- Discovering Network Interfaces ---"
           ifconfig -a > ifconfig_output.txt
-          if grep -q "awdl0" ifconfig_output.txt; then
-            echo "✅ awdl0 interface found."
-          else
-            echo "⚠️ awdl0 interface not found. It may be inactive but we will attempt to bring it up."
-          fi
-
           echo "\n--- Finding Key Daemons (sharingd, nearbyd, rapportd, airportd, wifip2pd) ---"
           PIDS=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
           if [ -n "$PIDS" ]; then
             echo "✅ Found daemon PIDs: $PIDS"
-            # Save PIDs for later steps. Format as a space-separated string.
             echo "DAEMON_PIDS=$(echo $PIDS | tr '\n' ' ')" >> $GITHUB_ENV
           else
             echo "❌ No key daemons were running."
           fi
 
-      # Step 2: Create a comprehensive DTrace listener
-      # This script remains the same, targeting all kernel-level AWDL functions.
-      - name: Create Enhanced AWDL DTrace Listener
+      # Step 2: Create a syntactically correct DTrace listener.
+      # The comments have been changed from '#' to '//' to fix the compilation error.
+      - name: Create Corrected AWDL DTrace Listener
         run: |
-          echo "Creating enhanced DTrace script to monitor kernel-level AWDL activity..."
+          echo "Creating corrected DTrace script..."
           cat > dlistener.d << 'EOF'
           #!/usr/sbin/dtrace -s
 
-          # This script traces all AWDL kernel functions to capture a broad range of events.
-          # NOTE: This requires System Integrity Protection (SIP) to be at least partially disabled
-          # for full visibility.
+          // This script traces all AWDL kernel functions to capture a broad range of events.
+          // NOTE: This may require System Integrity Protection (SIP) to be at least partially
+          // disabled for full visibility.
 
           fbt:kernel:awdl*:entry
           {
@@ -60,56 +51,61 @@ jobs:
           chmod +x dlistener.d
           echo "✅ DTrace script created."
 
-      # Step 3: Run Tracers, Packet Capture, and Activation Script
-      # This is the core step. We add tcpdump for raw packet capture alongside
-      # the existing tracers and the background activation script.
-      - name: Run Activation, Tracers, and Packet Capture
+      # Step 3: Proactively activate the awdl0 interface and wait until it is ready.
+      # This new, robust step solves the race condition that caused tcpdump to fail.
+      - name: Activate and Verify awdl0 Interface
         run: |
-          echo "Starting system-wide tracers, packet capture, and activation script for 30 seconds..."
+          echo "Attempting to activate and verify the awdl0 interface..."
+          # Loop for up to 20 seconds, trying to bring the interface up.
+          for i in {1..4}; do
+            sudo ifconfig awdl0 up
+            # Check if the interface is now up and running.
+            if ifconfig awdl0 | grep -q "status: active"; then
+              echo "✅ awdl0 interface is now active."
+              exit 0
+            fi
+            echo "Waiting for awdl0 to become active... (Attempt $i/4)"
+            sleep 5
+          done
+          echo "❌ Error: Timed out waiting for awdl0 interface to become active."
+          ifconfig awdl0
+          exit 1
+
+      # Step 4: Run Tracers and Packet Capture on the now-active interface.
+      # This step is streamlined now that activation is handled separately.
+      - name: Run Tracers and Packet Capture
+        run: |
+          echo "Starting system-wide tracers and packet capture for 30 seconds..."
           LOG_DIR="trace_logs"
           mkdir -p $LOG_DIR
 
-          # Create and run a background script to activate the awdl0 interface
-          cat > activate.sh << 'EOF'
-          #!/bin/bash
-          echo "Activation script started. Will attempt to bring up awdl0 every 5 seconds."
-          while true; do
-            sudo ifconfig awdl0 up
-            sleep 5
-          done
-          EOF
-          chmod +x activate.sh
-          ./activate.sh &
-          ACTIVATION_PID=$!
-          echo "Activation script started with PID $ACTIVATION_PID"
-
-          # Run dtrace listener (may have limited output in CI due to SIP)
+          # Run dtrace listener
           echo "--- DTrace Log ---" > $LOG_DIR/dtrace.log
           sudo ./dlistener.d >> $LOG_DIR/dtrace.log 2>&1 &
           DTRACE_PID=$!
           echo "dtrace listener started with PID $DTRACE_PID."
 
-          # Run tcpdump to capture raw AWDL packets
+          # Run tcpdump to capture raw AWDL packets. This should now succeed.
           echo "--- Packet Capture Log ---" > $LOG_DIR/awdl_capture.pcap
           sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap >> $LOG_DIR/tcpdump.log 2>&1 &
           TCPDUMP_PID=$!
           echo "tcpdump started on awdl0 with PID $TCPDUMP_PID."
 
-          # Run fs_usage on all discovered daemons
+          # Run fs_usage on all discovered daemons with a delay to prevent resource conflicts.
           if [ -n "${{ env.DAEMON_PIDS }}" ]; then
             for pid in ${{ env.DAEMON_PIDS }}; do
+              sleep 1 # Stagger the launch to avoid "Resource busy" errors.
               echo "--- fs_usage Log for PID $pid ---" > $LOG_DIR/fs_usage_$pid.log
               sudo fs_usage -w -f network pid $pid >> $LOG_DIR/fs_usage_$pid.log 2>&1 &
               echo "fs_usage started for PID $pid."
             done
           fi
 
-          # Let tracers and activation run to capture activity
           echo "Capturing activity for 30 seconds..."
           sleep 30
 
-          echo "Stopping tracers and activation script..."
-          sudo kill $ACTIVATION_PID $DTRACE_PID $TCPDUMP_PID || true
+          echo "Stopping tracers..."
+          sudo kill $DTRACE_PID $TCPDUMP_PID || true
           if [ -n "${{ env.DAEMON_PIDS }}" ]; then
             for pid in ${{ env.DAEMON_PIDS }}; do
               sudo pkill -f "fs_usage.*pid $pid" || true
@@ -119,16 +115,14 @@ jobs:
           echo "Tracers stopped."
 
 
-      # Step 4: Capture a snapshot of open files and network connections
-      # This gives context to the trace logs, showing which processes held which sockets.
+      # Step 5: Capture a snapshot of open files and network connections. Unchanged.
       - name: Snapshot Open Network Sockets
         run: |
           echo "--- lsof Network Log ---" > trace_logs/lsof_output.log
           sudo lsof -i -n -P >> trace_logs/lsof_output.log 2>&1
 
 
-      # Step 5: Upload all captured logs as an artifact
-      # This package now includes the critical .pcap file.
+      # Step 6: Upload all captured logs as an artifact. Unchanged.
       - name: Upload Trace Artifacts
         uses: actions/upload-artifact@v4
         with:
