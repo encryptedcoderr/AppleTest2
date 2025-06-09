@@ -1,221 +1,122 @@
-name: Advanced AVPlayer Stress Harness
+# This workflow performs internal reconnaissance of the AWDL/AirDrop stack on macOS.
+# It identifies the awdl0 interface and key daemons, then uses powerful system
+# tracing tools to monitor and log their activity. The goal is to collect
+# detailed data on system calls, file access, and network interactions, which
+# can be analyzed to discover new vulnerability vectors.
+
+name: Internal AWDL and AirDrop System Trace
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual triggering for targeted runs
 
 jobs:
-  stress-test-avplayer:
+  discover-and-trace-awdl:
     runs-on: macos-latest
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        # We are focusing on the two most promising scenarios that are compatible with the runner environment.
-        test_scenario: [ 'offset_fuzz', 'rapid_start_stop' ]
 
     steps:
-      # --- SETUP PHASE ---
-      - name: Clone Your Repository
-        run: git clone https://github.com/encryptedcoderr/AppleTest2/
-
-      - name: Navigate to working directory
-        run: cd AppleTest2/apple-positional-audio-codec-invalid-header-main && ls -l
-
-      # Create a more advanced Swift harness that supports different test modes
-      - name: Create Advanced Swift Player Harness
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
+      # Step 1: Discover network interfaces and key processes
+      # We start by listing all network interfaces to find awdl0 and getting the
+      # Process ID (PID) of sharingd, the primary daemon for AirDrop.
+      - name: Discover Interfaces and Daemons
+        id: discovery
         run: |
-          echo "Creating advanced Swift audio player harness..."
-          cat > harness.swift << 'EOF'
-          import Foundation
-          import AVFoundation
-
-          class PlayerDelegate: NSObject, AVAudioPlayerDelegate {
-              var playingCount = 0
-              func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-                  playingCount -= 1
-              }
-              func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-                  print("Harness Decode Error: \(error?.localizedDescription ?? "unknown error")")
-                  playingCount -= 1
-              }
-          }
-
-          if CommandLine.arguments.count < 3 {
-              print("Usage: ./harness <mode> <file_path>")
-              print("Modes: single, loop, concurrent, rapid")
-              exit(1)
-          }
-
-          let mode = CommandLine.arguments[1]
-          let filePath = CommandLine.arguments[2]
-          let fileURL = URL(fileURLWithPath: filePath)
-          let delegate = PlayerDelegate()
-
-          print("Running in mode: \(mode) with file: \(filePath)")
-
-          do {
-              switch mode {
-              case "rapid":
-                  let player = try AVAudioPlayer(contentsOf: fileURL)
-                  for _ in 0..<500 {
-                      player.play()
-                      if player.isPlaying { player.stop() }
-                  }
-              default: // "single"
-                  let player = try AVAudioPlayer(contentsOf: fileURL)
-                  delegate.playingCount = 1
-                  player.delegate = delegate
-                  player.play()
-                  while delegate.playingCount > 0 { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1)) }
-              }
-          } catch {
-              print("Harness failed to initialize player: \(error.localizedDescription)")
-          }
-          print("Harness finished mode: \(mode)")
-          EOF
-
-      # Create a C++ utility that can perform different types of corruption
-      - name: Create Advanced C++ File Corruptor
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Creating advanced C++ file corruption utility..."
-          cat > corruptor.cpp << 'EOF'
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <time.h>
-          #include <string.h>
-
-          int main(int argc, const char * argv[]) {
-              if (argc != 4) {
-                  fprintf(stderr, "Usage: %s <file> <offset> <corruption_mode>\n", argv[0]);
-                  fprintf(stderr, "Modes: tag\n");
-                  return 1;
-              }
-
-              const char* filePath = argv[1];
-              long offset = atol(argv[2]);
-              const char* mode = argv[3];
-
-              FILE *file = fopen(filePath, "r+b");
-              if (!file) { return 1; }
-
-              fseek(file, offset, SEEK_SET);
-
-              if (strcmp(mode, "tag") == 0) {
-                  unsigned char tag[4] = {0x01, 0x01, 0x00, 0xFF};
-                  fwrite(tag, 1, sizeof(tag), file);
-              }
-              
-              fclose(file);
-              return 0;
-          }
-          EOF
-
-      - name: Setup Environment
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '15.4'
-
-      - name: Compile Custom Tools
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "Compiling utilities..."
-          swiftc harness.swift -o harness
-          clang++ -g corruptor.cpp -o corruptor
-          if [ ! -f ./harness ] || [ ! -f ./corruptor ]; then
-            echo "Tool compilation failed."
-            exit 1
-          fi
-
-      # --- TEST EXECUTION PHASE ---
-      
-      - name: Start Syslog Monitoring
-        run: |
-          echo "Starting syslog stream..."
-          log stream --predicate 'process == "harness"' --style compact > system_log.txt &
-          echo $! > syslog.pid
-
-      - name: Run Offset Fuzzing Test
-        if: matrix.test_scenario == 'offset_fuzz'
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "### Starting Offset Fuzzing Scenario ###"
-          mkdir -p test_results
-          # Iterate over a range of offsets around our known target
-          for offset in $(seq 3400 20 3600); do
-            echo "--- Testing offset ${offset} ---"
-            POC_FILE="output_offset_${offset}.mp4"
-            LOG_FILE="test_results/log_offset_${offset}.txt"
-            cp IMG_1047.mov "$POC_FILE"
-            # Calculate the final corruption offset
-            CORRUPTION_OFFSET=$(( ${offset} + 72 ))
-            ./corruptor "$POC_FILE" $CORRUPTION_OFFSET "tag"
-            
-            # Enhanced LLDB script for detailed crash info
-            cat > player_debug_script.lldb << 'EOF'
-            run
-            thread backtrace all
-            register read
-            quit
-            EOF
-            
-            lldb -s player_debug_script.lldb -- ./harness single "$POC_FILE" > "$LOG_FILE" 2>&1 || true
-            if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
-              echo "✅✅✅ CRASH DETECTED for offset ${offset} ✅✅✅"
-              cat "$LOG_FILE"
-            else
-              rm "$LOG_FILE" # Clean up non-crashing logs
-            fi
-          done
-
-      - name: Run Rapid Start/Stop Test
-        if: matrix.test_scenario == 'rapid_start_stop'
-        working-directory: AppleTest2/apple-positional-audio-codec-invalid-header-main
-        run: |
-          echo "### Starting Rapid Start/Stop Scenario ###"
-          mkdir -p test_results
-          POC_FILE="output_rapid.mp4"
-          LOG_FILE="test_results/log_rapid.txt"
-          cp IMG_1047.mov "$POC_FILE"
-          # Corrupt at the known-good APAC stsd offset
-          ./corruptor "$POC_FILE" 3533 "tag"
-          
-          # Enhanced LLDB script for detailed crash info
-          cat > player_debug_script.lldb << 'EOF'
-          run
-          thread backtrace all
-          register read
-          quit
-          EOF
-          
-          lldb -s player_debug_script.lldb -- ./harness rapid "$POC_FILE" > "$LOG_FILE" 2>&1 || true
-          if grep -q "frame #0" "$LOG_FILE" && ! grep -q "exited with status = 0" "$LOG_FILE"; then
-            echo "✅✅✅ CRASH DETECTED during rapid start/stop ✅✅✅"
-            cat "$LOG_FILE"
+          echo "--- Discovering Network Interfaces ---"
+          ifconfig -a > ifconfig_output.txt
+          if grep -q "awdl0" ifconfig_output.txt; then
+            echo "✅ awdl0 interface found."
           else
-             rm "$LOG_FILE"
-          fi
-          
-      - name: Stop Syslog Monitoring
-        if: always()
-        run: |
-          echo "Stopping syslog stream..."
-          if [ -f syslog.pid ]; then
-            kill $(cat syslog.pid)
+            echo "⚠️ awdl0 interface not found. It may be inactive."
           fi
 
-      # Upload all artifacts for analysis
-      - name: Upload All Artifacts
-        if: always()
+          echo "\n--- Finding Key Daemons ---"
+          SHARINGD_PID=$(pgrep -x sharingd || echo "not_found")
+          if [ "$SHARINGD_PID" != "not_found" ]; then
+            echo "✅ sharingd daemon found with PID: $SHARINGD_PID"
+            echo "SHARINGD_PID=$SHARINGD_PID" >> $GITHUB_ENV
+          else
+            echo "❌ sharingd daemon not running."
+            # We continue anyway to capture system-wide wireless events.
+          fi
+
+      # Step 2: Use dtrace to create a system call listener
+      # This DTrace script (dlistener.d) will attach to key functions within the
+      # kernel related to AWDL and log any activity.
+      - name: Create AWDL DTrace Listener
+        run: |
+          echo "Creating DTrace script to monitor kernel-level AWDL activity..."
+          cat > dlistener.d << 'EOF'
+          #!/usr/sbin/dtrace -s
+
+          # This script traces AWDL functions in the kernel.
+          # NOTE: This requires System Integrity Protection (SIP) to be at least partially disabled.
+          # It may not run fully in a default GitHub Actions environment but is provided
+          # for use on a dedicated research machine.
+
+          fbt:kernel:awdl_net_add_if:entry,
+          fbt:kernel:awdl_net_del_if:entry,
+          fbt:kernel:awdl_control_path_send_tlv:entry,
+          fbt:kernel:awdl_control_path_receive_frame:entry
+          {
+            printf("PID %d (%s) triggered %s::%s\n", pid, execname, probemod, probefunc);
+          }
+          EOF
+          echo "✅ DTrace script created."
+
+      # Step 3: Run Tracers to Capture System Activity
+      # We will run multiple tracers simultaneously for a short duration.
+      # - dtrace: Captures deep kernel-level events (best-effort in CI).
+      # - fs_usage: Captures file system and network events from user-space daemons.
+      - name: Run System Tracers
+        run: |
+          echo "Starting system-wide tracers for 30 seconds..."
+          LOG_DIR="trace_logs"
+          mkdir -p $LOG_DIR
+
+          # Run dtrace listener (may have limited output in CI due to SIP)
+          echo "--- DTrace Log ---" > $LOG_DIR/dtrace.log
+          sudo ./dlistener.d >> $LOG_DIR/dtrace.log 2>&1 &
+          DTRACE_PID=$!
+          echo "dtrace listener started with PID $DTRACE_PID."
+
+          # Run fs_usage on sharingd if it's running
+          if [ -n "${{ env.SHARINGD_PID }}" ]; then
+            echo "--- fs_usage Log for sharingd (PID ${{ env.SHARINGD_PID }}) ---" > $LOG_DIR/fs_usage_sharingd.log
+            sudo fs_usage -w -f network pid ${{ env.SHARINGD_PID }} >> $LOG_DIR/fs_usage_sharingd.log 2>&1 &
+            FS_USAGE_PID=$!
+            echo "fs_usage started for sharingd with PID $FS_USAGE_PID."
+          fi
+
+          # Let tracers run for a while to capture activity
+          sleep 30
+
+          echo "Stopping tracers..."
+          sudo kill $DTRACE_PID || true
+          if [ -n "$FS_USAGE_PID" ]; then
+            sudo kill $FS_USAGE_PID || true
+          fi
+          sleep 5 # Allow time for logs to flush
+          echo "Tracers stopped."
+
+
+      # Step 4: Capture a snapshot of open files and network connections
+      # This helps identify which processes are communicating over the network.
+      - name: Snapshot Open Network Sockets
+        run: |
+          echo "--- lsof Network Log ---" > trace_logs/lsof_output.log
+          sudo lsof -i -n -P >> trace_logs/lsof_output.log 2>&1
+
+
+      # Step 5: Upload all captured logs as an artifact
+      # This package contains all the raw data for offline analysis.
+      - name: Upload Trace Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: stress-test-artifacts-${{ matrix.test_scenario }}
+          name: awdl-internal-trace-logs
           path: |
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/output_*.mp4
-            AppleTest2/apple-positional-audio-codec-invalid-header-main/test_results/
-            system_log.txt
+            ifconfig_output.txt
+            trace_logs/
           retention-days: 7
+          if-no-files-found: error
