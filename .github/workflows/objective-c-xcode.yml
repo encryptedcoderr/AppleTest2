@@ -28,43 +28,64 @@ jobs:
           echo "--- Diagnostic Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
           # --- ACTIVATION AND TRACING LOGIC ---
-          echo "[*] Activating AirDrop and tracing daemon startup..."
+          echo "[*] Beginning diagnostic trace..."
 
-          # 1. Force restart the main Bluetooth daemon to ensure it's running.
+          # Force restart the main Bluetooth daemon to ensure it's running.
           sudo launchctl kickstart -k system/com.apple.bluetoothd
           echo "    System Bluetooth daemon restarted."
           sleep 2
 
-          # 2. Store the original AirDrop discoverability mode.
+          # --- Part 1: Trace daemons in their default 'Contacts Only' state ---
+          echo "[*] Tracing daemons in their initial state for 20 seconds..."
+          PIDS_BEFORE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          if [ -n "$PIDS_BEFORE" ]; then
+              for pid in $PIDS_BEFORE; do
+                  PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
+                  echo "    Starting baseline dtruss for $PROC_NAME (PID $pid)..."
+                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-before.log" 2>&1 &
+              done
+              sleep 20
+              echo "[*] Stopping baseline tracers."
+              sudo pkill dtruss || true
+              sleep 2
+          else
+              echo "⚠️ No target daemons running for baseline trace."
+          fi
+          
+          # --- Part 2: Activate "Everyone" mode and trace the restart ---
+          echo "[*] Activating AirDrop 'Everyone' mode and tracing daemon startup..."
+
+          # Store the original AirDrop discoverability mode.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
 
-          # 3. Get a snapshot of interfaces *before* activation.
+          # Get a snapshot of interfaces *before* activation.
           ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
 
-          # 4. Set AirDrop to Everyone and VERIFY the change.
+          # Set AirDrop to Everyone and VERIFY the change.
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
           NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
           if [ "$NEW_MODE" != "Everyone" ]; then
               echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
+              # Restore original settings before exiting
+              sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
               exit 1
           fi
           echo "    Verified AirDrop mode is set to 'Everyone'."
           
-          # 5. Force restart all related daemons to apply the new settings.
+          # Force restart all related daemons to apply the new settings.
           echo "[*] Restarting sharingd, nearbyd, and rapportd to apply new settings..."
           sudo pkill sharingd nearbyd rapportd || true
           sleep 5 # Give daemons time to restart and read the new config.
 
-          # 6. Start tracing the RESTARTED daemons using dtruss for comprehensive syscall logging.
+          # Start tracing the RESTARTED daemons.
           echo "[*] Attaching tracers to newly started daemons for 90 seconds..."
-          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS_TO_TRACE" ]; then
-              for pid in $PIDS_TO_TRACE; do
+          PIDS_AFTER=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          if [ -n "$PIDS_AFTER" ]; then
+              for pid in $PIDS_AFTER; do
                   PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
                   echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
-                  # Using standard shell redirection for output is more robust than the -o flag.
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_$PROC_NAME_$pid.log" 2>&1 &
+                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-after.log" 2>&1 &
               done
           else
               echo "⚠️ Could not find any target daemons to trace after restart."
