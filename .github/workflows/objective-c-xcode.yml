@@ -35,48 +35,51 @@ jobs:
           echo "    System Bluetooth daemon restarted."
           sleep 2
 
-          # --- Part 1: Trace daemons in their default 'Contacts Only' state ---
-          echo "[*] Tracing daemons in their initial state for 20 seconds..."
-          PIDS_BEFORE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS_BEFORE" ]; then
-              for pid in $PIDS_BEFORE; do
-                  PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
-                  echo "    Starting baseline dtruss for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-before.log" 2>&1 &
-              done
-              sleep 20
-              echo "[*] Stopping baseline tracers."
-              sudo pkill dtruss || true
-              sleep 2
-          else
-              echo "⚠️ No target daemons running for baseline trace."
-          fi
-          
-          # --- Part 2: Activate "Everyone" mode and trace the restart ---
-          echo "[*] Activating AirDrop 'Everyone' mode and tracing daemon startup..."
+          # --- Part 1: Set AirDrop to "Everyone" and trace the immediate reaction ---
+          echo "[*] Activating AirDrop 'Everyone' mode and tracing daemon reaction..."
 
           # Store the original AirDrop discoverability mode.
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
           echo "    Original AirDrop mode: $ORIGINAL_MODE"
 
-          # Get a snapshot of interfaces *before* activation.
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
+          # Get a list of daemons to trace before we change the setting.
+          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          
+          # Start the first trace phase on the running daemons.
+          if [ -n "$PIDS_TO_TRACE" ]; then
+              for pid in $PIDS_TO_TRACE; do
+                  PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
+                  echo "    Starting reaction trace for $PROC_NAME (PID $pid)..."
+                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-reaction.log" 2>&1 &
+              done
+          else
+              echo "⚠️ No target daemons running for reaction trace."
+          fi
 
-          # Set AirDrop to Everyone and VERIFY the change.
+          # Now, change the setting. The tracers are already running and will capture the effect.
           sudo defaults write com.apple.sharingd DiscoverableMode Everyone
           NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
           if [ "$NEW_MODE" != "Everyone" ]; then
               echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
-              # Restore original settings before exiting
-              sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
+              sudo pkill dtruss || true
               exit 1
           fi
-          echo "    Verified AirDrop mode is set to 'Everyone'."
+          echo "    Verified AirDrop mode is set to 'Everyone'. Tracing reaction for 20 seconds..."
+          sleep 20
+          
+          echo "[*] Stopping reaction-phase tracers."
+          sudo pkill dtruss || true
+          sleep 2
+
+          # --- Part 2: Trace the daemon startup sequence ---
+          echo "[*] Restarting daemons and tracing their startup sequence..."
+
+          # Get a snapshot of interfaces before daemon restart.
+          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
           
           # Force restart all related daemons to apply the new settings.
-          echo "[*] Restarting sharingd, nearbyd, and rapportd to apply new settings..."
           sudo pkill sharingd nearbyd rapportd || true
-          sleep 5 # Give daemons time to restart and read the new config.
+          sleep 5 # Give daemons time to restart.
 
           # Start tracing the RESTARTED daemons.
           echo "[*] Attaching tracers to newly started daemons for 90 seconds..."
@@ -84,8 +87,8 @@ jobs:
           if [ -n "$PIDS_AFTER" ]; then
               for pid in $PIDS_AFTER; do
                   PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
-                  echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-after.log" 2>&1 &
+                  echo "    Starting startup trace for $PROC_NAME (PID $pid)..."
+                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-after_restart.log" 2>&1 &
               done
           else
               echo "⚠️ Could not find any target daemons to trace after restart."
