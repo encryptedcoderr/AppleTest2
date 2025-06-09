@@ -31,25 +31,24 @@ jobs:
             echo "❌ No key daemons were running."
           fi
 
-      # Step 2: Proactively activate the awdl0 interface by triggering a continuous Wi-Fi scan.
-      # This is more reliable than using high-level sharing commands.
-      - name: Activate and Verify awdl0 Interface
+      # Step 2: Proactively activate the awdl0 interface using the modern `wdutil` tool.
+      # This replaces the deprecated `airport` command.
+      - name: Activate and Verify awdl0 Interface via Power Cycle
         run: |
-          echo "Attempting to activate awdl0 via Wi-Fi scan stimulation..."
+          echo "Attempting to activate awdl0 via Wi-Fi power cycle..."
           
-          # Start a continuous Wi-Fi scan in the background. This forces the wireless
-          # hardware and its associated daemons to become fully active.
-          # The full path to the airport utility is required.
-          sudo /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s &
-          AIRPORT_SCAN_PID=$!
-          echo "Started continuous Wi-Fi scan with PID $AIRPORT_SCAN_PID to stimulate the wireless stack."
+          echo "Powering Wi-Fi off..."
+          sudo wdutil set power off
+          sleep 2 # Allow time for the interface to power down cleanly.
 
-          # Loop for up to 30 seconds, waiting for the interface to appear and become active.
+          echo "Powering Wi-Fi on..."
+          sudo wdutil set power on
+          sleep 5 # Allow time for services to re-initialize.
+
+          # Loop for up to 30 seconds, waiting for the interface to be created.
           for i in {1..6}; do
             if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
               echo "✅ awdl0 interface is now active."
-              # Kill the background scan process as it's no longer needed for activation.
-              sudo kill $AIRPORT_SCAN_PID
               exit 0
             fi
             echo "Waiting for awdl0 to be created and become active... (Attempt $i/6)"
@@ -57,16 +56,21 @@ jobs:
           done
 
           echo "❌ Error: Timed out waiting for awdl0 interface."
-          sudo kill $AIRPORT_SCAN_PID
           ifconfig -a
           exit 1
 
-      # Step 3: Run Tracers and Packet Capture on the now-active interface.
+      # Step 3: Run Tracers and Packet Capture while running diagnostics.
+      # This step now runs `wdutil diagnose` to generate rich system events during the capture.
       - name: Run Tracers and Packet Capture
         run: |
           echo "Starting system-wide tracers and packet capture for 30 seconds..."
           LOG_DIR="trace_logs"
           mkdir -p $LOG_DIR
+
+          # Run `wdutil diagnose` in the background to stimulate the system during tracing.
+          sudo wdutil diagnose &
+          DIAGNOSE_PID=$!
+          echo "Started 'wdutil diagnose' with PID $DIAGNOSE_PID."
 
           # Create and start the DTrace listener
           echo '#!/usr/sbin/dtrace -s\n\nfbt:kernel:awdl*:entry { printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\\n", pid, execname, probemod, probefunc); }' > dlistener.d
@@ -96,7 +100,7 @@ jobs:
           sleep 30
 
           echo "Stopping tracers..."
-          sudo kill $DTRACE_PID $TCPDUMP_PID || true
+          sudo kill $DIAGNOSE_PID $DTRACE_PID $TCPDUMP_PID || true
           if [ -n "${{ env.DAEMON_PIDS }}" ]; then
             for pid in ${{ env.DAEMON_PIDS }}; do
               sudo pkill -f "fs_usage.*pid $pid" || true
