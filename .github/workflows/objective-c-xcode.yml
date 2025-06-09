@@ -1,7 +1,7 @@
 # This workflow performs internal reconnaissance of the AWDL/AirDrop stack on macOS.
-# It identifies the awdl0 interface, finds all related daemons, actively
-# stimulates AWDL activity, and then uses powerful system tracing tools to
-# monitor and log the resulting system calls and network interactions.
+# It identifies the awdl0 interface, finds all related daemons (including airportd
+# and wifip2pd), actively stimulates AWDL activity, and then uses powerful system
+# tracing and packet capture tools to monitor and log all interactions.
 
 name: Active Internal AWDL and AirDrop System Trace
 on:
@@ -17,7 +17,8 @@ jobs:
 
     steps:
       # Step 1: Discover network interfaces and key processes
-      # We find all daemons related to sharing and proximity services.
+      # We now search for a wider range of daemons, including the core Wi-Fi
+      # and P2P daemons identified in the previous run's logs.
       - name: Discover Interfaces and Related Daemons
         id: discovery
         run: |
@@ -29,18 +30,18 @@ jobs:
             echo "⚠️ awdl0 interface not found. It may be inactive but we will attempt to bring it up."
           fi
 
-          echo "\n--- Finding Key Daemons (sharingd, nearbyd, rapportd) ---"
-          PIDS=$(pgrep -x sharingd nearbyd rapportd || echo "")
+          echo "\n--- Finding Key Daemons (sharingd, nearbyd, rapportd, airportd, wifip2pd) ---"
+          PIDS=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
           if [ -n "$PIDS" ]; then
             echo "✅ Found daemon PIDs: $PIDS"
             # Save PIDs for later steps. Format as a space-separated string.
             echo "DAEMON_PIDS=$(echo $PIDS | tr '\n' ' ')" >> $GITHUB_ENV
           else
-            echo "❌ No key daemons (sharingd, nearbyd, rapportd) were running."
+            echo "❌ No key daemons were running."
           fi
 
-      # Step 2: Create a more comprehensive DTrace listener
-      # This script now uses wildcards to trace all AWDL-related kernel functions.
+      # Step 2: Create a comprehensive DTrace listener
+      # This script remains the same, targeting all kernel-level AWDL functions.
       - name: Create Enhanced AWDL DTrace Listener
         run: |
           echo "Creating enhanced DTrace script to monitor kernel-level AWDL activity..."
@@ -59,12 +60,12 @@ jobs:
           chmod +x dlistener.d
           echo "✅ DTrace script created."
 
-      # Step 3: Run Tracers and Activation Script
-      # This is the core step. We run an activation script in the background
-      # to stimulate AWDL while concurrently logging all activity.
-      - name: Run Activation and System Tracers
+      # Step 3: Run Tracers, Packet Capture, and Activation Script
+      # This is the core step. We add tcpdump for raw packet capture alongside
+      # the existing tracers and the background activation script.
+      - name: Run Activation, Tracers, and Packet Capture
         run: |
-          echo "Starting system-wide tracers and activation script for 30 seconds..."
+          echo "Starting system-wide tracers, packet capture, and activation script for 30 seconds..."
           LOG_DIR="trace_logs"
           mkdir -p $LOG_DIR
 
@@ -88,6 +89,12 @@ jobs:
           DTRACE_PID=$!
           echo "dtrace listener started with PID $DTRACE_PID."
 
+          # Run tcpdump to capture raw AWDL packets
+          echo "--- Packet Capture Log ---" > $LOG_DIR/awdl_capture.pcap
+          sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap >> $LOG_DIR/tcpdump.log 2>&1 &
+          TCPDUMP_PID=$!
+          echo "tcpdump started on awdl0 with PID $TCPDUMP_PID."
+
           # Run fs_usage on all discovered daemons
           if [ -n "${{ env.DAEMON_PIDS }}" ]; then
             for pid in ${{ env.DAEMON_PIDS }}; do
@@ -102,7 +109,7 @@ jobs:
           sleep 30
 
           echo "Stopping tracers and activation script..."
-          sudo kill $ACTIVATION_PID $DTRACE_PID || true
+          sudo kill $ACTIVATION_PID $DTRACE_PID $TCPDUMP_PID || true
           if [ -n "${{ env.DAEMON_PIDS }}" ]; then
             for pid in ${{ env.DAEMON_PIDS }}; do
               sudo pkill -f "fs_usage.*pid $pid" || true
@@ -121,7 +128,7 @@ jobs:
 
 
       # Step 5: Upload all captured logs as an artifact
-      # This package contains all the raw data for offline analysis.
+      # This package now includes the critical .pcap file.
       - name: Upload Trace Artifacts
         uses: actions/upload-artifact@v4
         with:
