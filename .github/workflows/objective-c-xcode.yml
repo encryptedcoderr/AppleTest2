@@ -1,122 +1,182 @@
-# This workflow performs internal reconnaissance of the AWDL/AirDrop stack on macOS.
-# It uses a robust method to ensure the awdl0 interface is active, then traces
-# related daemons and captures raw network packets to create a comprehensive
-# dataset for vulnerability analysis.
+# This workflow builds and runs a complete fuzzing and tracing toolkit for AWDL/AirDrop.
+# It compiles a BLE fuzzer, creates a session runner script, and executes them
+# to actively probe for vulnerabilities while capturing detailed system logs,
+# kernel events, and raw network traffic.
 
-name: Active Internal AWDL and AirDrop System Trace
+name: Build and Run AWDL Fuzzing Session
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: # Allows manual triggering for targeted runs
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
-  discover-activate-and-trace-awdl:
+  build-and-fuzz:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Discover network interfaces and key processes.
-      - name: Discover Interfaces and Related Daemons
-        id: discovery
+      # Step 1: Build the BLE Fuzzer utility.
+      - name: Build BLE Fuzzer
         run: |
-          echo "--- Discovering Network Interfaces ---"
-          ifconfig -a > ifconfig_output.txt
-          echo "\n--- Finding Key Daemons (sharingd, nearbyd, rapportd, airportd, wifip2pd) ---"
-          PIDS=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS" ]; then
-            echo "✅ Found daemon PIDs: $PIDS"
-            echo "DAEMON_PIDS=$(echo $PIDS | tr '\n' ' ')" >> $GITHUB_ENV
-          else
-            echo "❌ No key daemons were running."
-          fi
+          echo "Creating ble-fuzzer.m source..."
+          cat > ble-fuzzer.m << 'EOF'
+          #import <Foundation/Foundation.h>
+          #import <CoreBluetooth/CoreBluetooth.h>
 
-      # Step 2: Proactively activate the awdl0 interface using ifconfig.
-      # This is a direct attempt to bring the interface up.
-      - name: Activate and Verify awdl0 Interface
+          typedef NS_ENUM(NSInteger, FuzzStrategy) {
+              FuzzStrategyCorruptLength, FuzzStrategyCorruptType,
+              FuzzStrategyCorruptPayload, FuzzStrategyRandomBytes
+          };
+
+          @interface BLEFuzzer : NSObject <CBPeripheralManagerDelegate>
+          @property (strong, nonatomic) CBPeripheralManager *peripheralManager;
+          @property (strong, nonatomic) NSTimer *fuzzingTimer;
+          @property (assign, nonatomic) FuzzStrategy currentStrategy;
+          @end
+
+          @implementation BLEFuzzer
+          - (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral {
+              if (peripheral.state == CBManagerStatePoweredOn) {
+                  NSLog(@"[Fuzzer] Bluetooth is powered on. Starting fuzzing loop...");
+                  self.fuzzingTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                                       target:self
+                                                                     selector:@selector(fuzzTick:)
+                                                                     userInfo:nil
+                                                                      repeats:YES];
+              } else {
+                  NSLog(@"[Fuzzer] Bluetooth is not powered on. State: %ld", (long)peripheral.state);
+                  [self.fuzzingTimer invalidate];
+              }
+          }
+
+          - (void)fuzzTick:(NSTimer *)timer {
+              [self.peripheralManager stopAdvertising];
+              self.currentStrategy = (self.currentStrategy + 1) % 4;
+              NSData *fuzzedPayload = [self generateFuzzedPayload];
+              [self.peripheralManager startAdvertising:@{ CBAdvertisementDataManufacturerDataKey: fuzzedPayload }];
+          }
+
+          - (NSData *)generateFuzzedPayload {
+              uint8_t base_data[] = {
+                  0x02, 0x01, 0x06, 0x17, 0xff, 0x4c, 0x00, 0x05, 0x12,
+                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                  0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc, 0xdd, 0xdd, 0x00
+              };
+              NSMutableData *data = [NSMutableData dataWithBytes:base_data length:sizeof(base_data)];
+              uint8_t *bytes = [data mutableBytes];
+
+              switch (self.currentStrategy) {
+                  case FuzzStrategyCorruptLength:
+                      NSLog(@"[Fuzzer] Strategy: Corrupt Length");
+                      bytes[3] = arc4random_uniform(30);
+                      bytes[9] = arc4random_uniform(20);
+                      break;
+                  case FuzzStrategyCorruptType:
+                      NSLog(@"[Fuzzer] Strategy: Corrupt Type");
+                      bytes[8] = arc4random_uniform(255);
+                      break;
+                  case FuzzStrategyCorruptPayload:
+                      NSLog(@"[Fuzzer] Strategy: Corrupt Payload");
+                      for (int i = 10; i < 27; i++) { bytes[i] = arc4random_uniform(256); }
+                      break;
+                  case FuzzStrategyRandomBytes:
+                      NSLog(@"[Fuzzer] Strategy: Random Bytes");
+                      NSUInteger randomLength = arc4random_uniform(30) + 1;
+                      uint8_t randomBytes[randomLength];
+                      for (int i = 0; i < randomLength; i++) { randomBytes[i] = arc4random_uniform(256); }
+                      return [NSData dataWithBytes:randomBytes length:randomLength];
+              }
+              return data;
+          }
+          @end
+
+          int main(int argc, const char * argv[]) {
+              @autoreleasepool {
+                  BLEFuzzer *fuzzer = [[BLEFuzzer alloc] init];
+                  fuzzer.peripheralManager = [[CBPeripheralManager alloc] initWithDelegate:fuzzer queue:nil];
+                  NSLog(@"[Fuzzer] Initialized. Press Ctrl+C to stop.");
+                  [[NSRunLoop currentRunLoop] run];
+              }
+              return 0;
+          }
+          EOF
+          clang -fobjc-arc -framework Foundation -framework CoreBluetooth ble-fuzzer.m -o ble-fuzzer
+          echo "✅ BLE Fuzzer compiled."
+
+      # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
+      - name: Create Fuzzing Session Script
         run: |
-          echo "Attempting to activate awdl0 via ifconfig..."
-          
-          # Loop for up to 30 seconds, attempting to bring the interface up and checking its status.
+          echo "Creating run_fuzz_session.sh script..."
+          cat > run_fuzz_session.sh << 'EOF'
+          #!/bin/bash
+          if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
+
+          LOG_DIR="fuzz_trace_logs"
+          mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
+          echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
+
+          # Start the BLE fuzzer in the background
+          echo "[*] Starting BLE fuzzer..."
+          sudo ./ble-fuzzer > $LOG_DIR/fuzzer.log 2>&1 &
+          FUZZER_PID=$!
+          echo "    Fuzzer running with PID $FUZZER_PID."
+
+          # Wait for awdl0 to appear
+          echo "[*] Waiting for awdl0 interface to activate..."
           for i in {1..6}; do
-            # Directly try to bring the interface up. This may fail if the interface
-            # doesn't exist yet, so we ignore errors.
-            sudo ifconfig awdl0 up 2>/dev/null || true
-
-            # Check if the interface now exists and is active.
-            if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
-              echo "✅ awdl0 interface is now active."
-              exit 0
-            fi
-            echo "Waiting for awdl0 to be created and become active... (Attempt $i/6)"
-            sleep 5
+              if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
+                  echo "✅ awdl0 is ACTIVE!"
+                  break
+              fi
+              if [ $i -eq 6 ]; then
+                  echo "❌ Timed out waiting for awdl0."
+                  sudo kill $FUZZER_PID
+                  exit 1
+              fi
+              sleep 5
           done
 
-          echo "❌ Error: Timed out waiting for awdl0 interface."
-          ifconfig -a
-          exit 1
-
-      # Step 3: Run Tracers and Packet Capture.
-      # This step no longer needs an active stimulus, as the interface should
-      # already be up. It will capture any ambient or system-initiated traffic.
-      - name: Run Tracers and Packet Capture
-        run: |
-          echo "Starting system-wide tracers and packet capture for 30 seconds..."
-          LOG_DIR="trace_logs"
-          mkdir -p $LOG_DIR
-
-          # Create and start the DTrace listener
+          # Start tracers now that the interface is active
+          echo "[*] Starting tracers for 60 seconds..."
           echo '#!/usr/sbin/dtrace -s\n\nfbt:kernel:awdl*:entry { printf("KERNEL AWDL: PID %d (%s) triggered %s::%s\\n", pid, execname, probemod, probefunc); }' > dlistener.d
           chmod +x dlistener.d
-          echo "--- DTrace Log ---" > $LOG_DIR/dtrace.log
-          sudo ./dlistener.d >> $LOG_DIR/dtrace.log 2>&1 &
+          sudo ./dlistener.d > $LOG_DIR/dtrace.log 2>&1 &
           DTRACE_PID=$!
-          echo "dtrace listener started with PID $DTRACE_PID."
 
-          # Run tcpdump to capture raw AWDL packets.
-          echo "--- Packet Capture Log ---" > $LOG_DIR/awdl_capture.pcap
-          sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap >> $LOG_DIR/tcpdump.log 2>&1 &
+          sudo tcpdump -i awdl0 -w $LOG_DIR/awdl_capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
           TCPDUMP_PID=$!
-          echo "tcpdump started on awdl0 with PID $TCPDUMP_PID."
 
-          # Run fs_usage on all discovered daemons with a delay to prevent resource conflicts.
-          if [ -n "${{ env.DAEMON_PIDS }}" ]; then
-            for pid in ${{ env.DAEMON_PIDS }}; do
-              sleep 1 # Stagger the launch to avoid "Resource busy" errors.
-              echo "--- fs_usage Log for PID $pid ---" > $LOG_DIR/fs_usage_$pid.log
-              sudo fs_usage -w -f network pid $pid >> $LOG_DIR/fs_usage_$pid.log 2>&1 &
-              echo "fs_usage started for PID $pid."
-            done
+          # Trace all relevant daemons
+          PIDS=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          if [ -n "$PIDS" ]; then
+              for pid in $PIDS; do
+                  sudo fs_usage -w -f network pid $pid > "$LOG_DIR/fs_usage_$pid.log" 2>&1 &
+              done
           fi
 
-          echo "Capturing activity for 30 seconds..."
-          sleep 30
+          sleep 60
 
-          echo "Stopping tracers..."
-          sudo kill $DTRACE_PID $TCPDUMP_PID || true
-          if [ -n "${{ env.DAEMON_PIDS }}" ]; then
-            for pid in ${{ env.DAEMON_PIDS }}; do
-              sudo pkill -f "fs_usage.*pid $pid" || true
-            done
+          echo "[*] Stopping fuzzer and all tracers..."
+          sudo kill $FUZZER_PID $DTRACE_PID $TCPDUMP_PID || true
+          if [ -n "$PIDS" ]; then
+              for pid in $PIDS; do sudo pkill -f "fs_usage.*pid $pid" || true; done
           fi
-          sleep 5 # Allow time for logs to flush
-          echo "Tracers stopped."
+          
+          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
+          ls -l $LOG_DIR
+          EOF
+          chmod +x run_fuzz_session.sh
 
+      # Step 3: Execute the fuzzing session.
+      - name: Run Fuzzing and Tracing Session
+        run: sudo ./run_fuzz_session.sh
 
-      # Step 4: Capture a snapshot of open files and network connections.
-      - name: Snapshot Open Network Sockets
-        run: |
-          echo "--- lsof Network Log ---" > trace_logs/lsof_output.log
-          sudo lsof -i -n -P >> trace_logs/lsof_output.log 2>&1
-
-
-      # Step 5: Upload all captured logs as an artifact.
-      - name: Upload Trace Artifacts
+      # Step 4: Upload all captured logs as an artifact for analysis.
+      - name: Upload Fuzzing Artifacts
+        if: always() # Ensure logs are uploaded even if a step fails
         uses: actions/upload-artifact@v4
         with:
-          name: awdl-internal-trace-logs
-          path: |
-            ifconfig_output.txt
-            trace_logs/
+          name: awdl-fuzzing-logs
+          path: fuzz_trace_logs/
           retention-days: 7
-          if-no-files-found: error
