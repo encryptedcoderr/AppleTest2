@@ -23,7 +23,20 @@ jobs:
           git clone https://github.com/googleprojectzero/p0tools.git
           echo "✅ Repository cloned."
 
-      # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
+      # Step 2: Add debugging to verify file paths.
+      - name: Verify Cloned Files
+        run: |
+          echo "[*] Verifying the contents of the p0tools directory..."
+          ls -lR p0tools/CoreAudioFuzz
+
+      # Step 3: Install Python dependencies for the fuzzer.
+      - name: Install Fuzzer Dependencies
+        run: |
+          echo "[*] Installing 'six' library for CoreAudioFuzz..."
+          pip3 install six
+          echo "✅ Dependencies installed."
+
+      # Step 4: Create the main session script to orchestrate the fuzzing and tracing.
       - name: Create Fuzzing Session Script
         run: |
           echo "Creating run_fuzz_session.sh script..."
@@ -37,7 +50,6 @@ jobs:
 
           # --- Tracing Setup ---
           echo "[*] Starting system call trace on coreaudiod..."
-          # We trace coreaudiod, as it's the primary daemon for audio services.
           COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
           if [ -n "$COREAUDIO_PID" ]; then
               sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
@@ -56,6 +68,7 @@ jobs:
           
           echo "[*] Launching CoreAudioFuzz for 90 seconds..."
           # The fuzzer will automatically find and test available services.
+          # We now explicitly use python3.
           sudo python3 $FUZZER_PATH > "$LOG_DIR/fuzzer_output.log" 2>&1 &
           FUZZER_PID=$!
           
@@ -80,11 +93,11 @@ jobs:
           EOF
           chmod +x run_fuzz_session.sh
 
-      # Step 3: Execute the fuzzing session.
+      # Step 5: Execute the fuzzing session.
       - name: Run Fuzzing and Tracing Session
         run: sudo ./run_fuzz_session.sh
 
-      # Step 4: Upload all captured logs and crash reports as an artifact.
+      # Step 6: Upload all captured logs and crash reports as an artifact.
       - name: Upload Fuzzing Artifacts
         if: always()
         uses: actions/upload-artifact@v4
