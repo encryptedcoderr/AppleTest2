@@ -1,6 +1,7 @@
 # This workflow uses the Google Project Zero CoreAudioFuzz tool to find
 # double-free and other memory corruption vulnerabilities in macOS audio services.
-# It sets up the environment, runs the fuzzer, and traces relevant daemons
+# It sets up the environment, builds all dependencies (Jackalope, TinyInst),
+# runs the fuzzer as intended by the authors, and traces relevant daemons
 # to capture a full diagnostic picture.
 
 name: CoreAudio Double-Free Fuzzing
@@ -16,28 +17,52 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Clone the p0tools repository which contains the CoreAudioFuzz tool.
+      # Step 1: Install build dependencies.
+      - name: Install Dependencies
+        run: |
+          echo "[*] Installing CMake..."
+          brew install cmake
+
+      # Step 2: Clone the p0tools repository.
       - name: Clone p0tools Repository
         run: |
           echo "[*] Cloning Google Project Zero's p0tools..."
           git clone https://github.com/googleprojectzero/p0tools.git
           echo "✅ Repository cloned."
-
-      # Step 2: Add debugging to verify file paths.
-      - name: Verify Cloned Files
+      
+      # Step 3: Check the runner architecture, as some tools are x86-specific.
+      - name: Check System Architecture
         run: |
-          echo "[*] Verifying the contents of the p0tools directory..."
-          ls -lR p0tools/CoreAudioFuzz
+          echo "[*] Checking architecture..."
+          uname -m
 
-      # Step 3: Install Python dependencies for the fuzzer.
-      - name: Install Fuzzer Dependencies
+      # Step 4: Build CoreAudioFuzz and its dependencies (Jackalope, TinyInst).
+      - name: Build CoreAudioFuzz and Dependencies
+        working-directory: p0tools/CoreAudioFuzz
         run: |
-          echo "[*] Installing 'six' library for CoreAudioFuzz..."
-          # Use --break-system-packages to handle externally managed Python environments.
-          pip3 install --break-system-packages six
-          echo "✅ Dependencies installed."
+          echo "[*] Building Jackalope and TinyInst..."
+          # The README provides a custom build process for the fuzzer and its components.
+          cd jackalope-modifications
+          git clone https://github.com/googleprojectzero/Jackalope.git
+          cd Jackalope
+          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
+          cd .. # back to jackalope-modifications
+          mkdir build
+          cd build
+          cmake -G Xcode ..
+          cmake --build . --config Release
+          cd ../.. # back to CoreAudioFuzz directory
+          
+          echo "[*] Building the CoreAudioFuzz harness..."
+          make
+          
+          echo "✅ Fuzzer and dependencies compiled."
+          echo "[*] Unzipping the provided corpus..."
+          unzip corpus.zip
+          
+          ls -l
 
-      # Step 4: Create the main session script to orchestrate the fuzzing and tracing.
+      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
       - name: Create Fuzzing Session Script
         run: |
           echo "Creating run_fuzz_session.sh script..."
@@ -61,17 +86,19 @@ jobs:
           fi
           
           # --- Fuzzing Logic ---
-          FUZZER_PATH="./p0tools/CoreAudioFuzz/fuzz_CoreAudio.py"
-          if [ ! -f "$FUZZER_PATH" ]; then
-              echo "❌ Fuzzer script not found at $FUZZER_PATH"
+          # We now execute the provided run.sh script, which handles the complex fuzzer invocation.
+          cd p0tools/CoreAudioFuzz
+          
+          if [ ! -f "./run.sh" ]; then
+              echo "❌ run.sh script not found in CoreAudioFuzz directory!"
               exit 1
           fi
           
-          echo "[*] Launching CoreAudioFuzz for 90 seconds..."
-          # The fuzzer will automatically find and test available services.
-          # We now explicitly use python3.
-          sudo python3 $FUZZER_PATH > "$LOG_DIR/fuzzer_output.log" 2>&1 &
+          echo "[*] Launching CoreAudioFuzz via run.sh for 90 seconds..."
+          sudo ./run.sh > "../../../$LOG_DIR/fuzzer_output.log" 2>&1 &
           FUZZER_PID=$!
+          
+          cd ../../
           
           sleep 90
 
@@ -80,7 +107,7 @@ jobs:
           sudo pkill -f dtruss || true
           
           echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
-          # Check for any generated crash reports, which are the primary indicator of success.
+          # Check for any generated crash reports.
           echo "[*] Checking for crash reports..."
           CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
           if [ -n "$CRASH_REPORTS" ]; then
@@ -94,11 +121,11 @@ jobs:
           EOF
           chmod +x run_fuzz_session.sh
 
-      # Step 5: Execute the fuzzing session.
+      # Step 6: Execute the fuzzing session.
       - name: Run Fuzzing and Tracing Session
         run: sudo ./run_fuzz_session.sh
 
-      # Step 6: Upload all captured logs and crash reports as an artifact.
+      # Step 7: Upload all captured logs and crash reports as an artifact.
       - name: Upload Fuzzing Artifacts
         if: always()
         uses: actions/upload-artifact@v4
