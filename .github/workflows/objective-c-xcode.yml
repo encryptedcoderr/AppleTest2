@@ -1,135 +1,126 @@
-# This workflow uses the Google Project Zero CoreAudioFuzz tool to find
-# double-free and other memory corruption vulnerabilities in macOS audio services.
-# It sets up the environment, builds all dependencies (Jackalope, TinyInst),
-# runs the fuzzer as intended by the authors, and traces relevant daemons
-# to capture a full diagnostic picture.
+/**
+ * This script automates editing a GitHub file by:
+ * 1. Clicking the edit button.
+ * 2. Deleting all text in the editor.
+ * 3. Pasting clipboard content.
+ * 4. Clicking the "Commit changes..." button.
+ * 5. Clicking the final "Commit changes" confirmation button after a 2-second delay.
+ * To use:
+ * - Navigate to the GitHub file view page.
+ * - Copy desired text to clipboard.
+ * - Open developer console (F12), paste this script, and press Enter.
+ */
 
-name: CoreAudio Double-Free Fuzzing
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch: # Allows manual triggering
+// Helper function for delay
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-jobs:
-  fuzz-coreaudio:
-    runs-on: macos-latest
+// Main automation logic
+async function runAutomation() {
+    console.log("▶️ Starting automation...");
+    console.log("Waiting 10 seconds...");
+    await sleep(10000); // Initial delay.
 
-    steps:
-      # Step 1: Install build dependencies.
-      - name: Install Dependencies
-        run: |
-          echo "[*] Installing CMake..."
-          brew install cmake
+    // 1. Click edit pencil icon.
+    console.log("✏️ Finding edit icon...");
+    const pencilIcon = document.querySelector('svg.octicon-pencil');
+    if (pencilIcon) {
+        const clickableParent = pencilIcon.closest('a, button, div[role="button"]');
+        if (clickableParent) {
+            console.log("✅ Clicking edit icon...");
+            clickableParent.click();
+        } else {
+            console.error("Error: Edit icon found, but no clickable parent.");
+            return;
+        }
+    } else {
+        console.error("Error: Edit icon not found. Ensure you're on the file view page.");
+        return;
+    }
 
-      # Step 2: Clone the p0tools repository.
-      - name: Clone p0tools Repository
-        run: |
-          echo "[*] Cloning Google Project Zero's p0tools..."
-          git clone https://github.com/googleprojectzero/p0tools.git
-          echo "✅ Repository cloned."
-      
-      # Step 3: Check the runner architecture, as some tools are x86-specific.
-      - name: Check System Architecture
-        run: |
-          echo "[*] Checking architecture..."
-          uname -m
+    console.log("Waiting for editor...");
+    await sleep(3000); // Wait for editor to load.
 
-      # Step 4: Build CoreAudioFuzz and its dependencies (Jackalope, TinyInst).
-      - name: Build CoreAudioFuzz and Dependencies
-        working-directory: p0tools/CoreAudioFuzz
-        run: |
-          echo "[*] Building Jackalope and TinyInst..."
-          # The README provides a custom build process for the fuzzer and its components.
-          cd jackalope-modifications
-          git clone https://github.com/googleprojectzero/Jackalope.git
-          cd Jackalope
-          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-          cd .. # back to jackalope-modifications
-          mkdir build
-          cd build
-          cmake -G Xcode ..
-          cmake --build . --config Release
-          cd ../.. # back to CoreAudioFuzz directory
-          
-          echo "[*] Building the CoreAudioFuzz harness..."
-          make
-          
-          echo "✅ Fuzzer and dependencies compiled."
-          echo "[*] Unzipping the provided corpus..."
-          unzip corpus.zip
-          
-          ls -l
+    // 2. Find and clear editor.
+    const editorContent = document.querySelector('div.cm-content');
+    if (!editorContent) {
+        console.error("Error: Editor content area (.cm-content) not found.");
+        return;
+    }
+    console.log("✅ Clearing editor...");
+    const range = document.createRange();
+    range.selectNodeContents(editorContent);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    editorContent.innerHTML = ''; // Delete content.
 
-      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
-      - name: Create Fuzzing Session Script
-        run: |
-          echo "Creating run_fuzz_session.sh script..."
-          cat > run_fuzz_session.sh << 'EOF'
-          #!/bin/bash
-          if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
+    console.log("✅ Deleted. Pasting from clipboard...");
 
-          LOG_DIR="coreaudio_fuzz_logs"
-          mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
+    // 3. Paste clipboard content.
+    try {
+        const clipboardText = await navigator.clipboard.readText();
+        if (clipboardText) {
+            console.log("✅ Pasting clipboard content...");
+            editorContent.innerText = clipboardText;
+        } else {
+            console.warn("Warning: Clipboard empty.");
+        }
+    } catch (err) {
+        console.error("Error: Clipboard access failed. Check permissions.", err);
+        return;
+    }
 
-          # --- Tracing Setup ---
-          echo "[*] Starting system call trace on coreaudiod..."
-          COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
-          if [ -n "$COREAUDIO_PID" ]; then
-              sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
-              DTRUSS_PID=$!
-              echo "    dtruss attached to coreaudiod (PID $COREAUDIO_PID)."
-          else
-              echo "⚠️ coreaudiod not found. Tracing may be incomplete."
-          fi
-          
-          # --- Fuzzing Logic ---
-          # We now execute the provided run.sh script, which handles the complex fuzzer invocation.
-          cd p0tools/CoreAudioFuzz
-          
-          if [ ! -f "./run.sh" ]; then
-              echo "❌ run.sh script not found in CoreAudioFuzz directory!"
-              exit 1
-          fi
-          
-          echo "[*] Launching CoreAudioFuzz via run.sh for 90 seconds..."
-          sudo ./run.sh > "../../../$LOG_DIR/fuzzer_output.log" 2>&1 &
-          FUZZER_PID=$!
-          
-          cd ../../
-          
-          sleep 90
+    console.log("Waiting 3 seconds before commit...");
+    await sleep(3000); // 3-second delay before commit.
 
-          echo "[*] Stopping fuzzer and tracers..."
-          sudo kill $FUZZER_PID || true
-          sudo pkill -f dtruss || true
-          
-          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
-          # Check for any generated crash reports.
-          echo "[*] Checking for crash reports..."
-          CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
-          if [ -n "$CRASH_REPORTS" ]; then
-              echo "🚨 SUCCESS: Crash reports found! Copying to logs directory."
-              sudo cp $CRASH_REPORTS $LOG_DIR/
-          else
-              echo "    No new crash reports found."
-          fi
+    // 4. Click "Commit changes..." button.
+    console.log("🔍 Finding 'Commit changes...' button...");
+    const allButtons = document.querySelectorAll('button');
+    let commitButton = null;
+    for (const button of allButtons) {
+        if (button.textContent.trim().includes('Commit changes...')) {
+            commitButton = button;
+            break;
+        }
+    }
 
-          ls -l $LOG_DIR
-          EOF
-          chmod +x run_fuzz_session.sh
+    if (commitButton) {
+        console.log("✅ Clicking 'Commit changes...'...");
+        commitButton.click();
 
-      # Step 6: Execute the fuzzing session.
-      - name: Run Fuzzing and Tracing Session
-        run: sudo ./run_fuzz_session.sh
+        // --- NEW STEP ---
+        // Wait for the commit confirmation dialog to appear.
+        console.log("⏳ Waiting 2 seconds for confirmation dialog...");
+        await sleep(2000);
 
-      # Step 7: Upload all captured logs and crash reports as an artifact.
-      - name: Upload Fuzzing Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coreaudio-fuzzing-logs
-          path: coreaudio_fuzz_logs/
-          retention-days: 7
+        // 5. Click the final "Commit changes" button in the dialog.
+        console.log("🔍 Finding final 'Commit changes' button...");
+        const finalButtons = document.querySelectorAll('button');
+        let confirmButton = null;
+        for (const button of finalButtons) {
+            // Use an exact text match to distinguish from the first button.
+            if (button.textContent.trim() === 'Commit changes') {
+                confirmButton = button;
+                break;
+            }
+        }
+
+        if (confirmButton) {
+            console.log("✅ Clicking final 'Commit changes' button...");
+            confirmButton.click();
+            console.log("🎉 Automation complete! Commit has been confirmed.");
+        } else {
+            console.error("Error: Could not find the final 'Commit changes' button. The dialog may not have appeared or the UI may have changed.");
+        }
+        // --- END OF NEW STEP ---
+
+    } else {
+        console.error("Error: Could not find the 'Commit changes...' button. The script may need to be updated if the GitHub UI has changed.");
+        return;
+    }
+}
+
+// Run the script
+runAutomation();
