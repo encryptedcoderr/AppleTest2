@@ -1,1 +1,144 @@
+# This workflow uses the Google Project Zero CoreAudioFuzz tool to find
+# double-free and other memory corruption vulnerabilities in macOS audio services.
+# It sets up the environment, builds all dependencies (Jackalope, TinyInst),
+# runs the fuzzer as intended by the authors, and traces relevant daemons
+# to capture a full diagnostic picture.
 
+name: CoreAudio Double-Free Fuzzing
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  fuzz-coreaudio:
+    runs-on: macos-latest
+
+    steps:
+      # Step 1: Install build dependencies.
+      - name: Install Dependencies
+        run: |
+          echo "[*] Installing CMake..."
+          brew install cmake
+
+      # Step 2: Clone the p0tools repository.
+      - name: Clone p0tools Repository
+        run: |
+          echo "[*] Cloning Google Project Zero's p0tools..."
+          git clone https://github.com/googleprojectzero/p0tools.git
+          echo "✅ Repository cloned."
+      
+      # Step 3: Check the runner architecture, as some tools are x86-specific.
+      - name: Check System Architecture
+        run: |
+          echo "[*] Checking architecture..."
+          uname -m
+
+      # Step 4: Build CoreAudioFuzz and its dependencies (Jackalope, TinyInst).
+      - name: Build CoreAudioFuzz and Dependencies
+        working-directory: p0tools/CoreAudioFuzz
+        run: |
+          echo "[*] Building Jackalope and TinyInst..."
+          cd jackalope-modifications
+
+          # Fix the main CMakeLists.txt file by adding the required project() command.
+          echo "[*] Patching Jackalope's CMakeLists.txt..."
+          (echo "cmake_minimum_required(VERSION 3.10)" && echo "project(JackalopeFuzzer CXX)" && cat CMakeLists.txt) > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
+
+          git clone https://github.com/googleprojectzero/Jackalope.git
+          cd Jackalope
+          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
+          cd .. # back to jackalope-modifications
+
+          # Fix TinyInst's CMakeLists.txt to update the minimum version requirement.
+          echo "[*] Patching TinyInst's CMakeLists.txt..."
+          sed -i.bak 's/cmake_minimum_required(VERSION 2.8.8)/cmake_minimum_required(VERSION 3.10)/' Jackalope/TinyInst/CMakeLists.txt
+
+          mkdir build
+          cd build
+          cmake -G Xcode ..
+          cmake --build . --config Release
+          cd ../.. # back to CoreAudioFuzz directory
+          
+          echo "[*] Building the CoreAudioFuzz harness..."
+          make
+          
+          echo "✅ Fuzzer and dependencies compiled."
+          echo "[*] Unzipping the provided corpus..."
+          unzip corpus.zip
+          
+          ls -l
+
+      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
+      - name: Create Fuzzing Session Script
+        run: |
+          echo "Creating run_fuzz_session.sh script..."
+          cat > run_fuzz_session.sh << 'EOF'
+          #!/bin/bash
+          if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
+
+          LOG_DIR="coreaudio_fuzz_logs"
+          mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
+          echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
+
+          # --- Tracing Setup ---
+          echo "[*] Starting system call trace on coreaudiod..."
+          COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
+          if [ -n "$COREAUDIO_PID" ]; then
+              sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
+              DTRUSS_PID=$!
+              echo "    dtruss attached to coreaudiod (PID $COREAUDIO_PID)."
+          else
+              echo "⚠️ coreaudiod not found. Tracing may be incomplete."
+          fi
+          
+          # --- Fuzzing Logic ---
+          # We now execute the provided run.sh script, which handles the complex fuzzer invocation.
+          cd p0tools/CoreAudioFuzz
+          
+          if [ ! -f "./run.sh" ]; then
+              echo "❌ run.sh script not found in CoreAudioFuzz directory!"
+              exit 1
+          fi
+          
+          echo "[*] Launching CoreAudioFuzz via run.sh for 90 seconds..."
+          sudo ./run.sh > "../../../$LOG_DIR/fuzzer_output.log" 2>&1 &
+          FUZZER_PID=$!
+          
+          cd ../../
+          
+          sleep 90
+
+          echo "[*] Stopping fuzzer and tracers..."
+          sudo kill $FUZZER_PID || true
+          sudo pkill -f dtruss || true
+          
+          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
+          # Check for any generated crash reports, which are the primary indicator of success.
+          echo "[*] Checking for crash reports..."
+          CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
+          if [ -n "$CRASH_REPORTS" ]; then
+              echo "🚨 SUCCESS: Crash reports found! Copying to logs directory."
+              sudo cp $CRASH_REPORTS $LOG_DIR/
+          else
+              echo "    No new crash reports found."
+          fi
+
+          ls -l $LOG_DIR
+          EOF
+          chmod +x run_fuzz_session.sh
+
+      # Step 6: Execute the fuzzing session.
+      - name: Run Fuzzing and Tracing Session
+        run: sudo ./run_fuzz_session.sh
+
+      # Step 7: Upload all captured logs and crash reports as an artifact.
+      - name: Upload Fuzzing Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreaudio-fuzzing-logs
+          path: coreaudio_fuzz_logs/
+          retention-days: 7
