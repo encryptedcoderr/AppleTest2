@@ -45,11 +45,7 @@ jobs:
 
           # Fix the CMakeLists.txt file by adding the required project() command.
           echo "[*] Patching CMakeLists.txt to prevent build warnings..."
-          cat <<EOF > patch_header.txt
-cmake_minimum_required(VERSION 3.10)
-project(JackalopeFuzzer CXX)
-EOF
-          cat patch_header.txt CMakeLists.txt > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
+          (echo "cmake_minimum_required(VERSION 3.10)" && echo "project(JackalopeFuzzer CXX)" && cat CMakeLists.txt) > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
 
           git clone https://github.com/googleprojectzero/Jackalope.git
           cd Jackalope
