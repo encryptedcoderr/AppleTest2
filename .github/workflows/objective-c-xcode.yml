@@ -1,82 +1,226 @@
- This workflow uses the Google Project Zero CoreAudioFuzz tool to find
-# double-free and other memory corruption vulnerabilities in macOS audio services.
-# It sets up the environment, builds all dependencies (Jackalope, TinyInst),
-# runs the fuzzer as intended by the authors, and traces relevant daemons
-# to capture a full diagnostic picture.
+// ==UserScript==
+// @name         GitHub Automation
+// @namespace    http://tampermonkey.net/
+// @version      1.3
+// @description  Automates GitHub file edits, commits, and navigation to Actions page without console
+// @author       You
+// @match        https://*.github.com/*
+// @include      https://github.com/*
+// @run-at       document-end
+// @grant        none
+// ==/UserScript==
 
-name: CoreAudio Double-Free Fuzzing
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch: # Allows manual triggering
+(function () {
+  'use strict';
 
-jobs:
-  fuzz-coreaudio:
-    runs-on: macos-latest
+  // Automation function
+  async function runAutomation() {
+    try {
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
 
-    steps:
-      # Step 1: Install build dependencies.
-      - name: Install Dependencies
-        run: |
-          echo "[*] Installing CMake..."
-          brew install cmake
-      # Step 2: Clone the p0tools repository.
-      - name: Clone p0tools Repository
-        run: |
-          echo "[*] Cloning Google Project Zero's p0tools..."
-          git clone https://github.com/googleprojectzero/p0tools.git
-          echo "✅ Repository cloned."
-      
-      # Step 3: Check the runner architecture, as some tools are x86-specific.
-      - name: Check System Architecture
-        run: |
-          echo "[*] Checking architecture..."
-          uname -m
-      # Step 4: Build CoreAudioFuzz and its dependencies (Jackalope, TinyInst).
-      - name: Build CoreAudioFuzz and Dependencies
-        working-directory: p0tools/CoreAudioFuzz
-        run: |
-          echo "[*] Building Jackalope and TinyInst..."
-          # The README provides a custom build process for the fuzzer and its components.
-          cd jackalope-modifications
-          git clone https://github.com/googleprojectzero/Jackalope.git
-          cd Jackalope
-          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-          cd .. # back to jackalope-modifications
-          mkdir build
-          cd build
-          cmake -G Xcode ..
-          cmake --build . --config Release
-          cd ../.. # back to CoreAudioFuzz directory
-          
-          echo "[*] Building the CoreAudioFuzz harness..."
-          make
-          
-          echo "✅ Fuzzer and dependencies compiled."
-          echo "[*] Unzipping the provided corpus..."
-          unzip corpus.zip
-          
-          ls -l
-      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
-      - name: Create Fuzzing Session Script
-        run: |
-          echo "Creating run_fuzz_session.sh script..."
-          cat > run_fuzz_session.sh << 'EOF'
-          #!/bin/bash
-          if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
-          LOG_DIR="coreaudio_fuzz_logs"
-          mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
-          # --- Tracing Setup ---
-          echo "[*] Starting system call trace on coreaudiod..."
-          COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
-          if [ -n "$COREAUDIO_PID" ]; then
-              sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
-              DTRUSS_PID=$!
-              echo "    dtruss attached to coreaudiod (PID $COREAUDIO_PID)."
-          else
-              echo "⚠️ coreaudiod not found. Tracing may be incomplete."
-          fi
-          
+      console.log('🔄 Starting automation...');
+
+      // 1. Find and click edit icon
+      console.log('🔍 Finding edit icon...');
+      const pencilIcon = document.querySelector('svg.octicon-pencil, [data-testid="edit-button"], [aria-label*="edit"]');
+      if (!pencilIcon) {
+        console.error('Error: Edit icon not found. Ensure you’re on the file view page.');
+        return;
+      }
+      const clickableParent = pencilIcon.closest('a, button, [role="button"], [data-action]');
+      if (!clickableParent) {
+        console.error('Error: Edit icon found, but no clickable parent.');
+        return;
+      }
+      console.log('🖱️ Clicking edit icon...');
+      clickableParent.click();
+
+      console.log('⏳ Waiting for editor...');
+      await sleep(3000);
+
+      // 2. Find and clear editor
+      const editorContent = document.querySelector('div.cm-content, [contenteditable="true"], textarea[name*="content"]');
+      if (!editorContent) {
+        console.error('Error: Editor content area not found.');
+        return;
+      }
+      console.log('🧹 Clearing editor...');
+      editorContent.innerText = '';
+
+      console.log('📋 Pasting from clipboard...');
+
+      // 3. Paste clipboard content
+      try {
+        const clipboardText = await navigator.clipboard.readText();
+        if (clipboardText) {
+          console.log('📥 Pasting clipboard content...');
+          editorContent.innerText = clipboardText;
+        } else {
+          console.warn('Warning: Clipboard empty.');
+        }
+      } catch (err) {
+        console.error('Error: Clipboard access failed. Check permissions.', err);
+        return;
+      }
+
+      console.log('⏳ Waiting 3 seconds before commit...');
+      await sleep(3000);
+
+      // 4. Click "Commit changes..." button
+      console.log('🔍 Finding "Commit changes..." button...');
+      let commitButton = Array.from(document.querySelectorAll('button')).find(b =>
+        b.textContent.trim().includes('Commit changes')
+      );
+      if (!commitButton) {
+        console.error('Error: Could not find the "Commit changes..." button.');
+        return;
+      }
+      console.log('🖱️ Clicking "Commit changes..."...');
+      commitButton.click();
+
+      console.log('⏳ Waiting 2 seconds for confirmation dialog...');
+      await sleep(2000);
+
+      // 5. Click final "Commit changes" button
+      console.log('🔍 Finding final "Commit changes" button...');
+      let confirmButton = Array.from(document.querySelectorAll('button')).find(b =>
+        b.textContent.trim() === 'Commit changes'
+      );
+      if (!confirmButton) {
+        console.error('Error: Could not find the final "Commit changes" button.');
+        return;
+      }
+      console.log('🖱️ Clicking final "Commit changes" button...');
+      confirmButton.click();
+      console.log('✅ Commit confirmed!');
+
+      // 6. Disable "Leave site?" prompt
+      console.log('🔧 Disabling "Leave site?" confirmation...');
+      window.onbeforeunload = null;
+
+      // 7. Navigate to Actions page
+      const repoPath = window.location.pathname.split('/').slice(0, 3).join('/');
+      const targetUrl = `${window.location.origin}${repoPath}/actions`;
+      console.log(`🚀 Navigating to ${targetUrl}...`);
+      await sleep(100);
+      window.location.href = targetUrl;
+    } catch (e) {
+      console.error('Automation failed:', e);
+      alert('Automation failed. Check console (F12) for details.');
+    }
+  }
+
+  // Function to create UI
+  function createUI() {
+    try {
+      // Prevent duplicate UI
+      if (document.getElementById('custom-script-executor-container')) {
+        console.log('Executor box already exists.');
+        return;
+      }
+
+      // --- UI Creation ---
+      const container = document.createElement('div');
+      container.id = 'custom-script-executor-container';
+      Object.assign(container.style, {
+        position: 'fixed',
+        top: '20px',
+        right: '20px',
+        zIndex: '9999',
+        backgroundColor: '#24292f',
+        color: '#c9d1d9',
+        border: '1px solid #444c56',
+        borderRadius: '8px',
+        padding: '16px',
+        boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+        fontFamily: 'sans-serif',
+        width: '400px'
+      });
+
+      const title = document.createElement('h3');
+      title.textContent = 'Automation Control';
+      Object.assign(title.style, {
+        margin: '0 0 10px 0',
+        fontSize: '16px',
+        borderBottom: '1px solid #444c56',
+        paddingBottom: '8px'
+      });
+
+      const instructions = document.createElement('p');
+      instructions.textContent = 'Click "Run Automation" to edit, commit, and navigate to Actions.';
+      Object.assign(instructions.style, {
+        margin: '0 0 10px 0',
+        fontSize: '14px'
+      });
+
+      const runButton = document.createElement('button');
+      runButton.textContent = 'Run Automation';
+      Object.assign(runButton.style, {
+        width: '100%',
+        padding: '10px',
+        border: '1px solid #388bfd',
+        borderRadius: '6px',
+        backgroundColor: '#238636',
+        color: 'white',
+        cursor: 'pointer',
+        fontWeight: 'bold',
+        marginBottom: '10px'
+      });
+      runButton.onmouseover = () => (runButton.style.backgroundColor = '#2ea043');
+      runButton.onmouseout = () => (runButton.style.backgroundColor = '#238636');
+
+      const closeButton = document.createElement('button');
+      closeButton.textContent = 'X';
+      Object.assign(closeButton.style, {
+        position: 'absolute',
+        top: '10px',
+        right: '10px',
+        background: 'transparent',
+        border: 'none',
+        color: '#8b949e',
+        fontSize: '16px',
+        cursor: 'pointer'
+      });
+
+      // --- Run Automation Logic ---
+      runButton.onclick = () => {
+        console.log('🚀 Running automation...');
+        runAutomation();
+      };
+
+      closeButton.onclick = () => container.remove();
+
+      // Assemble UI
+      container.appendChild(closeButton);
+      container.appendChild(title);
+      container.appendChild(instructions);
+      container.appendChild(runButton);
+      document.body.appendChild(container);
+      console.log('🛠️ Automation control box created.');
+
+      // Optional: Run automation automatically on page load
+      // Uncomment the following line to enable auto-run
+      // runAutomation();
+    } catch (e) {
+      console.error('Error creating UI:', e);
+    }
+  }
+
+  // Run after DOM is ready
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    createUI();
+  } else {
+    document.addEventListener('DOMContentLoaded', createUI);
+  }
+
+  // Handle SPA navigation
+  let lastPath = window.location.pathname;
+  setInterval(() => {
+    if (window.location.pathname !== lastPath) {
+      lastPath = window.location.pathname;
+      createUI();
+    }
+  }, 1000);
+})();
