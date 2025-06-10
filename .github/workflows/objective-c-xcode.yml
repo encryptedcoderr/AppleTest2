@@ -1,9 +1,9 @@
-# This workflow builds and executes a targeted IOCTL fuzzer against macOS
-# wireless drivers. It programmatically activates AirDrop to create the necessary
-# interface, then runs the fuzzer while capturing system call traces and
-# raw network packets to analyze the driver's response.
+# This workflow uses the Google Project Zero CoreAudioFuzz tool to find
+# double-free and other memory corruption vulnerabilities in macOS audio services.
+# It sets up the environment, runs the fuzzer, and traces relevant daemons
+# to capture a full diagnostic picture.
 
-name: Build and Run AWDL IOCTL Fuzzing Session
+name: CoreAudio Double-Free Fuzzing
 on:
   push:
     branches: [ main ]
@@ -12,118 +12,16 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-and-run-ioctl-fuzzer:
+  fuzz-coreaudio:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Create and compile the NEW mutational ioctl_fuzzer utility.
-      - name: Build Mutational IOCTL Fuzzer
+      # Step 1: Clone the p0tools repository which contains the CoreAudioFuzz tool.
+      - name: Clone p0tools Repository
         run: |
-          echo "Creating ioctl_mutational_fuzzer.c source..."
-          cat > ioctl_fuzzer.c << 'EOF'
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <fcntl.h>
-          #include <sys/ioctl.h>
-          #include <time.h>
-          #include <errno.h>
-
-          // We are now focusing on the single IOCTL command that returned an unusual success code.
-          // This is our primary fuzzing target.
-          #define TARGET_IOCTL_CMD 0x4004667A
-
-          // Define the maximum size for our fuzzing buffer.
-          // We will test various payload sizes up to this limit.
-          #define MAX_FUZZ_BUFFER_SIZE 8192
-
-          // --- NEW: Fuzzing Mutation Strategies ---
-          // These functions apply small, targeted changes to a data buffer.
-          // This is more effective than sending purely random data.
-
-          // Overwrites a random byte in the buffer.
-          void mutate_byte(char *buffer, size_t size) {
-              if (size == 0) return;
-              buffer[rand() % size] = rand() % 256;
-          }
-
-          // Flips a random bit in a random byte of the buffer.
-          void mutate_bitflip(char *buffer, size_t size) {
-              if (size == 0) return;
-              size_t byte_pos = rand() % size;
-              int bit_pos = rand() % 8;
-              buffer[byte_pos] ^= (1 << bit_pos);
-          }
-
-          // Inserts a "magic number" (common edge case values) into the buffer.
-          void mutate_insert_magic(char *buffer, size_t size) {
-              if (size < 4) return;
-              unsigned int magic_values[] = {0, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF};
-              size_t pos = rand() % (size - 4);
-              memcpy(&buffer[pos], &magic_values[rand() % 4], 4);
-          }
-          // ---
-
-          /**
-           * The main fuzzing function. It now uses targeted mutations.
-           * @param device_path The path to the device file for the driver (e.g., "/dev/bpf0").
-           */
-          void fuzz_ioctl(const char *device_path) {
-              int fd;
-              char fuzz_buffer[MAX_FUZZ_BUFFER_SIZE];
-              
-              printf("[Fuzzer] Opening device: %s\n", device_path);
-              fd = open(device_path, O_RDWR);
-              if (fd < 0) {
-                  perror("[Fuzzer] Error opening device. Exiting");
-                  return;
-              }
-
-              printf("[Fuzzer] Starting mutational IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
-
-              int iteration = 0;
-              while (1) {
-                  // Start with a clean buffer of zeros.
-                  memset(fuzz_buffer, 0, MAX_FUZZ_BUFFER_SIZE);
-                  size_t current_fuzz_size = (rand() % MAX_FUZZ_BUFFER_SIZE) + 1;
-                  
-                  // Apply a random mutation to the buffer.
-                  int mutation_type = rand() % 3;
-                  switch (mutation_type) {
-                      case 0: mutate_byte(fuzz_buffer, current_fuzz_size); break;
-                      case 1: mutate_bitflip(fuzz_buffer, current_fuzz_size); break;
-                      case 2: mutate_insert_magic(fuzz_buffer, current_fuzz_size); break;
-                  }
-
-                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte mutated buffer...\n", iteration, (unsigned long)TARGET_IOCTL_CMD, current_fuzz_size);
-
-                  if (ioctl(fd, TARGET_IOCTL_CMD, fuzz_buffer) < 0) {
-                      fprintf(stderr, "    > ioctl failed with error %d (%s)\n", errno, strerror(errno));
-                  } else {
-                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", (unsigned long)TARGET_IOCTL_CMD);
-                  }
-
-                  iteration++;
-                  usleep(100000); // 100ms
-              }
-
-              close(fd);
-          }
-
-          int main(int argc, char **argv) {
-              if (argc != 2) {
-                  fprintf(stderr, "Usage: %s <device_path>\n", argv[0]);
-                  fprintf(stderr, "Example: sudo %s /dev/bpf0\n", argv[0]);
-                  return 1;
-              }
-              srand(time(NULL));
-              fuzz_ioctl(argv[1]);
-              return 0;
-          }
-          EOF
-          clang ioctl_fuzzer.c -o ioctl_fuzzer
-          echo "✅ Mutational IOCTL Fuzzer compiled."
+          echo "[*] Cloning Google Project Zero's p0tools..."
+          git clone https://github.com/googleprojectzero/p0tools.git
+          echo "✅ Repository cloned."
 
       # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
       - name: Create Fuzzing Session Script
@@ -133,69 +31,51 @@ jobs:
           #!/bin/bash
           if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
 
-          LOG_DIR="fuzz_trace_logs"
+          LOG_DIR="coreaudio_fuzz_logs"
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
+          echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # --- Activation and Dynamic Interface Discovery ---
-          echo "[*] Activating AirDrop and discovering wireless interface..."
-          ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
-          sudo defaults write com.apple.sharingd DiscoverableMode Everyone
-          sudo pkill sharingd || true
-          sleep 5
-
-          TARGET_INTERFACE=""
-          for i in {1..6}; do
-              TARGET_INTERFACE=$(ifconfig -l | tr ' ' '\n' | grep -E '^(awdl|llw)[0-9]+' || echo "")
-              if [ -n "$TARGET_INTERFACE" ]; then
-                  echo "✅ Discovered P2P interface: $TARGET_INTERFACE"
-                  break
-              fi
-              echo "    Waiting for P2P interface to appear... (Attempt $i/6)"
-              sleep 5
-          done
-
-          if [ -z "$TARGET_INTERFACE" ]; then
-              echo "⚠️ Could not discover a P2P interface. Tracers may not capture relevant data."
+          # --- Tracing Setup ---
+          echo "[*] Starting system call trace on coreaudiod..."
+          # We trace coreaudiod, as it's the primary daemon for audio services.
+          COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
+          if [ -n "$COREAUDIO_PID" ]; then
+              sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
+              DTRUSS_PID=$!
+              echo "    dtruss attached to coreaudiod (PID $COREAUDIO_PID)."
+          else
+              echo "⚠️ coreaudiod not found. Tracing may be incomplete."
           fi
           
-          # --- Fuzzing and Tracing Logic ---
-          echo "[*] Starting tracers and IOCTL fuzzer..."
-
-          # Trace relevant daemons using dtruss.
-          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS_TO_TRACE" ]; then
-              for pid in $PIDS_TO_TRACE; do
-                  PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
-                  echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_$PROC_NAME_$pid.log" 2>&1 &
-              done
+          # --- Fuzzing Logic ---
+          FUZZER_PATH="./p0tools/CoreAudioFuzz/fuzz_CoreAudio.py"
+          if [ ! -f "$FUZZER_PATH" ]; then
+              echo "❌ Fuzzer script not found at $FUZZER_PATH"
+              exit 1
           fi
           
-          # Start packet capture if the interface was found.
-          if [ -n "$TARGET_INTERFACE" ]; then
-              sudo tcpdump -i $TARGET_INTERFACE -w $LOG_DIR/capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
-              TCPDUMP_PID=$!
-          fi
-          
-          # Start the IOCTL fuzzer.
-          echo "[*] Launching IOCTL fuzzer against /dev/bpf0 for 60 seconds..."
-          sudo ./ioctl_fuzzer /dev/bpf0 > "$LOG_DIR/fuzzer.log" 2>&1 &
+          echo "[*] Launching CoreAudioFuzz for 90 seconds..."
+          # The fuzzer will automatically find and test available services.
+          sudo python3 $FUZZER_PATH > "$LOG_DIR/fuzzer_output.log" 2>&1 &
           FUZZER_PID=$!
-
-          sleep 60
-
-          echo "[*] Stopping fuzzer and all tracers..."
-          sudo kill $FUZZER_PID $TCPDUMP_PID || true
-          sudo pkill dtruss || true
           
-          # --- Cleanup ---
-          echo "[*] Restoring original AirDrop settings..."
-          sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
-          sudo pkill sharingd
-          echo "    Restored AirDrop mode to '$ORIGINAL_MODE'."
+          sleep 90
 
+          echo "[*] Stopping fuzzer and tracers..."
+          sudo kill $FUZZER_PID || true
+          sudo pkill -f dtruss || true
+          
           echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
+          # Check for any generated crash reports, which are the primary indicator of success.
+          echo "[*] Checking for crash reports..."
+          CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
+          if [ -n "$CRASH_REPORTS" ]; then
+              echo "🚨 SUCCESS: Crash reports found! Copying to logs directory."
+              sudo cp $CRASH_REPORTS $LOG_DIR/
+          else
+              echo "    No new crash reports found."
+          fi
+
           ls -l $LOG_DIR
           EOF
           chmod +x run_fuzz_session.sh
@@ -204,11 +84,11 @@ jobs:
       - name: Run Fuzzing and Tracing Session
         run: sudo ./run_fuzz_session.sh
 
-      # Step 4: Upload all captured logs as an artifact for analysis.
+      # Step 4: Upload all captured logs and crash reports as an artifact.
       - name: Upload Fuzzing Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: awdl-ioctl-fuzz-logs
-          path: fuzz_trace_logs/
+          name: coreaudio-fuzzing-logs
+          path: coreaudio_fuzz_logs/
           retention-days: 7
