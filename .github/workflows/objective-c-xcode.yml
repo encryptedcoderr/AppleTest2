@@ -16,10 +16,10 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Create and compile the ioctl_fuzzer utility from source.
-      - name: Build IOCTL Fuzzer
+      # Step 1: Create and compile the NEW mutational ioctl_fuzzer utility.
+      - name: Build Mutational IOCTL Fuzzer
         run: |
-          echo "Creating ioctl_fuzzer.c source..."
+          echo "Creating ioctl_mutational_fuzzer.c source..."
           cat > ioctl_fuzzer.c << 'EOF'
           #include <stdio.h>
           #include <stdlib.h>
@@ -30,26 +30,43 @@ jobs:
           #include <time.h>
           #include <errno.h>
 
-          // We are now focusing on the single IOCTL command that returned an unusual success code.
+          # We are now focusing on the single IOCTL command that returned an unusual success code.
+          # This is our primary fuzzing target.
           #define TARGET_IOCTL_CMD 0x4004667A
 
-          // We will test a range of buffer sizes to probe for parsing errors.
+          # Define the maximum size for our fuzzing buffer.
+          # We will test various payload sizes up to this limit.
           #define MAX_FUZZ_BUFFER_SIZE 8192
 
-          /**
-           * Generates a buffer of random bytes.
-           * @param buffer The buffer to fill with random data.
-           * @param size The size of the buffer to generate.
-           */
-          void generate_fuzz_buffer(char *buffer, size_t size) {
-              for (size_t i = 0; i < size; i++) {
-                  buffer[i] = rand() % 256;
-              }
+          // --- NEW: Fuzzing Mutation Strategies ---
+          // These functions apply small, targeted changes to a data buffer.
+          // This is more effective than sending purely random data.
+
+          // Overwrites a random byte in the buffer.
+          void mutate_byte(char *buffer, size_t size) {
+              if (size == 0) return;
+              buffer[rand() % size] = rand() % 256;
           }
 
+          // Flips a random bit in a random byte of the buffer.
+          void mutate_bitflip(char *buffer, size_t size) {
+              if (size == 0) return;
+              size_t byte_pos = rand() % size;
+              int bit_pos = rand() % 8;
+              buffer[byte_pos] ^= (1 << bit_pos);
+          }
+
+          // Inserts a "magic number" (common edge case values) into the buffer.
+          void mutate_insert_magic(char *buffer, size_t size) {
+              if (size < 4) return;
+              unsigned int magic_values[] = {0, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF};
+              size_t pos = rand() % (size - 4);
+              memcpy(&buffer[pos], &magic_values[rand() % 4], 4);
+          }
+          // ---
+
           /**
-           * The main fuzzing function. It now focuses on a single command
-           * and varies the size of the payload.
+           * The main fuzzing function. It now uses targeted mutations.
            * @param device_path The path to the device file for the driver (e.g., "/dev/bpf0").
            */
           void fuzz_ioctl(const char *device_path) {
@@ -59,22 +76,28 @@ jobs:
               printf("[Fuzzer] Opening device: %s\n", device_path);
               fd = open(device_path, O_RDWR);
               if (fd < 0) {
-                  perror("[Fuzzer] Error opening device. This is expected if the device node is not present in the CI environment. The fuzzer will now exit");
+                  perror("[Fuzzer] Error opening device. Exiting");
                   return;
               }
 
-              printf("[Fuzzer] Starting targeted IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
+              printf("[Fuzzer] Starting mutational IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
 
               int iteration = 0;
               while (1) {
-                  // Vary the size of the fuzzing buffer on each iteration.
+                  // Start with a clean buffer of zeros.
+                  memset(fuzz_buffer, 0, MAX_FUZZ_BUFFER_SIZE);
                   size_t current_fuzz_size = (rand() % MAX_FUZZ_BUFFER_SIZE) + 1;
                   
-                  generate_fuzz_buffer(fuzz_buffer, current_fuzz_size);
+                  // Apply a random mutation to the buffer.
+                  int mutation_type = rand() % 3;
+                  switch (mutation_type) {
+                      case 0: mutate_byte(fuzz_buffer, current_fuzz_size); break;
+                      case 1: mutate_bitflip(fuzz_buffer, current_fuzz_size); break;
+                      case 2: mutate_insert_magic(fuzz_buffer, current_fuzz_size); break;
+                  }
 
-                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte buffer...\n", iteration, TARGET_IOCTL_CMD, current_fuzz_size);
+                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte mutated buffer...\n", iteration, TARGET_IOCTL_CMD, current_fuzz_size);
 
-                  // Send the fuzzed data to the driver.
                   if (ioctl(fd, TARGET_IOCTL_CMD, fuzz_buffer) < 0) {
                       fprintf(stderr, "    > ioctl failed with error %d (%s)\n", errno, strerror(errno));
                   } else {
@@ -100,7 +123,7 @@ jobs:
           }
           EOF
           clang ioctl_fuzzer.c -o ioctl_fuzzer
-          echo "✅ IOCTL Fuzzer compiled."
+          echo "✅ Mutational IOCTL Fuzzer compiled."
 
       # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
       - name: Create Fuzzing Session Script
