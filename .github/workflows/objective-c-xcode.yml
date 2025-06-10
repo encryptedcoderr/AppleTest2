@@ -30,27 +30,32 @@ jobs:
           #include <time.h>
           #include <errno.h>
 
-          // These are the failing ioctl commands we discovered in the dtruss logs.
-          // We will target these specific commands in our fuzzer.
-          #define IOCTL_CMD_1 0x20006405
-          #define IOCTL_CMD_2 0x4004667A
-          #define IOCTL_CMD_3 0x40087468
+          // We are now focusing on the single IOCTL command that returned an unusual success code.
+          #define TARGET_IOCTL_CMD 0x4004667A
 
-          #define FUZZ_BUFFER_SIZE 4096 // The size of the malformed data buffer to send.
+          // We will test a range of buffer sizes to probe for parsing errors.
+          #define MAX_FUZZ_BUFFER_SIZE 8192
 
+          /**
+           * Generates a buffer of random bytes.
+           * @param buffer The buffer to fill with random data.
+           * @param size The size of the buffer to generate.
+           */
           void generate_fuzz_buffer(char *buffer, size_t size) {
               for (size_t i = 0; i < size; i++) {
                   buffer[i] = rand() % 256;
               }
           }
 
+          /**
+           * The main fuzzing function. It now focuses on a single command
+           * and varies the size of the payload.
+           * @param device_path The path to the device file for the driver (e.g., "/dev/bpf0").
+           */
           void fuzz_ioctl(const char *device_path) {
               int fd;
-              char fuzz_buffer[FUZZ_BUFFER_SIZE];
+              char fuzz_buffer[MAX_FUZZ_BUFFER_SIZE];
               
-              unsigned long commands[] = {IOCTL_CMD_1, IOCTL_CMD_2, IOCTL_CMD_3};
-              int num_commands = sizeof(commands) / sizeof(commands[0]);
-
               printf("[Fuzzer] Opening device: %s\n", device_path);
               fd = open(device_path, O_RDWR);
               if (fd < 0) {
@@ -58,18 +63,22 @@ jobs:
                   return;
               }
 
-              printf("[Fuzzer] Starting IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
+              printf("[Fuzzer] Starting targeted IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
 
               int iteration = 0;
               while (1) {
-                  unsigned long cmd = commands[iteration % num_commands];
-                  generate_fuzz_buffer(fuzz_buffer, FUZZ_BUFFER_SIZE);
-                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx...\n", iteration, cmd);
+                  // Vary the size of the fuzzing buffer on each iteration.
+                  size_t current_fuzz_size = (rand() % MAX_FUZZ_BUFFER_SIZE) + 1;
                   
-                  if (ioctl(fd, cmd, fuzz_buffer) < 0) {
-                      fprintf(stderr, "    > ioctl failed with error %d (%s) - This is expected.\n", errno, strerror(errno));
+                  generate_fuzz_buffer(fuzz_buffer, current_fuzz_size);
+
+                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte buffer...\n", iteration, TARGET_IOCTL_CMD, current_fuzz_size);
+
+                  // Send the fuzzed data to the driver.
+                  if (ioctl(fd, TARGET_IOCTL_CMD, fuzz_buffer) < 0) {
+                      fprintf(stderr, "    > ioctl failed with error %d (%s)\n", errno, strerror(errno));
                   } else {
-                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", cmd);
+                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", TARGET_IOCTL_CMD);
                   }
 
                   iteration++;
@@ -114,8 +123,6 @@ jobs:
 
           TARGET_INTERFACE=""
           for i in {1..6}; do
-              # We use `ifconfig -l` which is cleaner for just getting names.
-              # We grep for 'awdl' or 'llw' which are common for peer-to-peer interfaces.
               TARGET_INTERFACE=$(ifconfig -l | tr ' ' '\n' | grep -E '^(awdl|llw)[0-9]+' || echo "")
               if [ -n "$TARGET_INTERFACE" ]; then
                   echo "✅ Discovered P2P interface: $TARGET_INTERFACE"
@@ -127,7 +134,6 @@ jobs:
 
           if [ -z "$TARGET_INTERFACE" ]; then
               echo "⚠️ Could not discover a P2P interface. Tracers may not capture relevant data."
-              # We proceed anyway to capture daemon logs.
           fi
           
           # --- Fuzzing and Tracing Logic ---
@@ -150,8 +156,6 @@ jobs:
           fi
           
           # Start the IOCTL fuzzer.
-          # NOTE: The device path /dev/bpf0 is a guess for a generic packet interface.
-          # On a dedicated test machine, this may need to be changed.
           echo "[*] Launching IOCTL fuzzer against /dev/bpf0 for 60 seconds..."
           sudo ./ioctl_fuzzer /dev/bpf0 > "$LOG_DIR/fuzzer.log" 2>&1 &
           FUZZER_PID=$!
