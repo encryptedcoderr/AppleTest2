@@ -30,12 +30,12 @@ jobs:
           #include <time.h>
           #include <errno.h>
 
-          # We are now focusing on the single IOCTL command that returned an unusual success code.
-          # This is our primary fuzzing target.
+          // We are now focusing on the single IOCTL command that returned an unusual success code.
+          // This is our primary fuzzing target.
           #define TARGET_IOCTL_CMD 0x4004667A
 
-          # Define the maximum size for our fuzzing buffer.
-          # We will test various payload sizes up to this limit.
+          // Define the maximum size for our fuzzing buffer.
+          // We will test various payload sizes up to this limit.
           #define MAX_FUZZ_BUFFER_SIZE 8192
 
           // --- NEW: Fuzzing Mutation Strategies ---
@@ -96,12 +96,12 @@ jobs:
                       case 2: mutate_insert_magic(fuzz_buffer, current_fuzz_size); break;
                   }
 
-                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte mutated buffer...\n", iteration, TARGET_IOCTL_CMD, current_fuzz_size);
+                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx with a %zu-byte mutated buffer...\n", iteration, (unsigned long)TARGET_IOCTL_CMD, current_fuzz_size);
 
                   if (ioctl(fd, TARGET_IOCTL_CMD, fuzz_buffer) < 0) {
                       fprintf(stderr, "    > ioctl failed with error %d (%s)\n", errno, strerror(errno));
                   } else {
-                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", TARGET_IOCTL_CMD);
+                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", (unsigned long)TARGET_IOCTL_CMD);
                   }
 
                   iteration++;
