@@ -1,8 +1,9 @@
-# This workflow is a focused diagnostic tool. It attempts to activate
-# AirDrop and then runs a deep system call trace on all related daemons to
-# understand why the wireless interface is not activating as expected.
+# This workflow builds and executes a targeted IOCTL fuzzer against macOS
+# wireless drivers. It programmatically activates AirDrop to create the necessary
+# interface, then runs the fuzzer while capturing system call traces and
+# raw network packets to analyze the driver's response.
 
-name: Build and Run AWDL Diagnostic Trace
+name: Build and Run AWDL IOCTL Fuzzing Session
 on:
   push:
     branches: [ main ]
@@ -11,128 +12,176 @@ on:
   workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build-and-trace:
+  build-and-run-ioctl-fuzzer:
     runs-on: macos-latest
 
     steps:
-      # Step 1: Create the main session script to orchestrate the diagnostic trace.
-      - name: Create Diagnostic Trace Script
+      # Step 1: Create and compile the ioctl_fuzzer utility from source.
+      - name: Build IOCTL Fuzzer
         run: |
-          echo "Creating run_trace_session.sh script..."
-          cat > run_trace_session.sh << 'EOF'
+          echo "Creating ioctl_fuzzer.c source..."
+          cat > ioctl_fuzzer.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <sys/ioctl.h>
+          #include <time.h>
+          #include <errno.h>
+
+          // These are the failing ioctl commands we discovered in the dtruss logs.
+          // We will target these specific commands in our fuzzer.
+          #define IOCTL_CMD_1 0x20006405
+          #define IOCTL_CMD_2 0x4004667A
+          #define IOCTL_CMD_3 0x40087468
+
+          #define FUZZ_BUFFER_SIZE 4096 // The size of the malformed data buffer to send.
+
+          void generate_fuzz_buffer(char *buffer, size_t size) {
+              for (size_t i = 0; i < size; i++) {
+                  buffer[i] = rand() % 256;
+              }
+          }
+
+          void fuzz_ioctl(const char *device_path) {
+              int fd;
+              char fuzz_buffer[FUZZ_BUFFER_SIZE];
+              
+              unsigned long commands[] = {IOCTL_CMD_1, IOCTL_CMD_2, IOCTL_CMD_3};
+              int num_commands = sizeof(commands) / sizeof(commands[0]);
+
+              printf("[Fuzzer] Opening device: %s\n", device_path);
+              fd = open(device_path, O_RDWR);
+              if (fd < 0) {
+                  perror("[Fuzzer] Error opening device. This is expected if the device node is not present in the CI environment. The fuzzer will now exit");
+                  return;
+              }
+
+              printf("[Fuzzer] Starting IOCTL fuzzing loop. Press Ctrl+C to stop.\n");
+
+              int iteration = 0;
+              while (1) {
+                  unsigned long cmd = commands[iteration % num_commands];
+                  generate_fuzz_buffer(fuzz_buffer, FUZZ_BUFFER_SIZE);
+                  printf("[Fuzzer] Iteration %d: Fuzzing cmd 0x%lx...\n", iteration, cmd);
+                  
+                  if (ioctl(fd, cmd, fuzz_buffer) < 0) {
+                      fprintf(stderr, "    > ioctl failed with error %d (%s) - This is expected.\n", errno, strerror(errno));
+                  } else {
+                      printf("    > SUCCESS! ioctl command 0x%lx returned non-error. This is highly unusual!\n", cmd);
+                  }
+
+                  iteration++;
+                  usleep(100000); // 100ms
+              }
+
+              close(fd);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  fprintf(stderr, "Usage: %s <device_path>\n", argv[0]);
+                  fprintf(stderr, "Example: sudo %s /dev/bpf0\n", argv[0]);
+                  return 1;
+              }
+              srand(time(NULL));
+              fuzz_ioctl(argv[1]);
+              return 0;
+          }
+          EOF
+          clang ioctl_fuzzer.c -o ioctl_fuzzer
+          echo "✅ IOCTL Fuzzer compiled."
+
+      # Step 2: Create the main session script to orchestrate the fuzzing and tracing.
+      - name: Create Fuzzing Session Script
+        run: |
+          echo "Creating run_fuzz_session.sh script..."
+          cat > run_fuzz_session.sh << 'EOF'
           #!/bin/bash
           if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
 
-          LOG_DIR="diagnostic_trace_logs"
+          LOG_DIR="fuzz_trace_logs"
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- Diagnostic Session Started: $(date) ---" | tee $LOG_DIR/session.log
+          echo "--- Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # --- ACTIVATION AND TRACING LOGIC ---
-          echo "[*] Beginning diagnostic trace..."
-
-          # Force restart the main Bluetooth daemon to ensure it's running.
-          sudo launchctl kickstart -k system/com.apple.bluetoothd
-          echo "    System Bluetooth daemon restarted."
-          sleep 2
-
-          # --- Part 1: Set AirDrop to "Everyone" and trace the immediate reaction ---
-          echo "[*] Activating AirDrop 'Everyone' mode and tracing daemon reaction..."
-
-          # Store the original AirDrop discoverability mode.
+          # --- Activation and Dynamic Interface Discovery ---
+          echo "[*] Activating AirDrop and discovering wireless interface..."
           ORIGINAL_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "Contacts Only")
-          echo "    Original AirDrop mode: $ORIGINAL_MODE"
+          sudo defaults write com.apple.sharingd DiscoverableMode Everyone
+          sudo pkill sharingd || true
+          sleep 5
 
-          # Get a list of daemons to trace before we change the setting.
-          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
+          TARGET_INTERFACE=""
+          for i in {1..6}; do
+              # We use `ifconfig -l` which is cleaner for just getting names.
+              # We grep for 'awdl' or 'llw' which are common for peer-to-peer interfaces.
+              TARGET_INTERFACE=$(ifconfig -l | tr ' ' '\n' | grep -E '^(awdl|llw)[0-9]+' || echo "")
+              if [ -n "$TARGET_INTERFACE" ]; then
+                  echo "✅ Discovered P2P interface: $TARGET_INTERFACE"
+                  break
+              fi
+              echo "    Waiting for P2P interface to appear... (Attempt $i/6)"
+              sleep 5
+          done
+
+          if [ -z "$TARGET_INTERFACE" ]; then
+              echo "⚠️ Could not discover a P2P interface. Tracers may not capture relevant data."
+              # We proceed anyway to capture daemon logs.
+          fi
           
-          # Start the first trace phase on the running daemons.
+          # --- Fuzzing and Tracing Logic ---
+          echo "[*] Starting tracers and IOCTL fuzzer..."
+
+          # Trace relevant daemons using dtruss.
+          PIDS_TO_TRACE=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
           if [ -n "$PIDS_TO_TRACE" ]; then
               for pid in $PIDS_TO_TRACE; do
                   PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
-                  echo "    Starting reaction trace for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-reaction.log" 2>&1 &
+                  echo "    Starting dtruss for $PROC_NAME (PID $pid)..."
+                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_$PROC_NAME_$pid.log" 2>&1 &
               done
-          else
-              echo "⚠️ No target daemons running for reaction trace."
           fi
-
-          # Now, change the setting. The tracers are already running and will capture the effect.
-          sudo defaults write com.apple.sharingd DiscoverableMode Everyone
-          NEW_MODE=$(defaults read com.apple.sharingd DiscoverableMode)
-          if [ "$NEW_MODE" != "Everyone" ]; then
-              echo "❌ Failed to set AirDrop mode to 'Everyone'. Current mode is '$NEW_MODE'."
-              sudo pkill dtruss || true
-              exit 1
-          fi
-          echo "    Verified AirDrop mode is set to 'Everyone'. Tracing reaction for 20 seconds..."
-          sleep 20
           
-          echo "[*] Stopping reaction-phase tracers."
-          sudo pkill dtruss || true
-          sleep 2
-
-          # --- Part 2: Trace the daemon startup sequence ---
-          echo "[*] Restarting daemons and tracing their startup sequence..."
-
-          # Get a snapshot of interfaces before daemon restart.
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_before.txt
-          
-          # Force restart all related daemons to apply the new settings.
-          sudo pkill sharingd nearbyd rapportd || true
-          sleep 5 # Give daemons time to restart.
-
-          # Start tracing the RESTARTED daemons.
-          echo "[*] Attaching tracers to newly started daemons for 90 seconds..."
-          PIDS_AFTER=$(pgrep -x sharingd nearbyd rapportd airportd wifip2pd || echo "")
-          if [ -n "$PIDS_AFTER" ]; then
-              for pid in $PIDS_AFTER; do
-                  PROC_NAME=$(ps -p $pid -o comm= | xargs basename)
-                  echo "    Starting startup trace for $PROC_NAME (PID $pid)..."
-                  sudo dtruss -p $pid -f -d > "$LOG_DIR/dtruss_${PROC_NAME}_${pid}-after_restart.log" 2>&1 &
-              done
-          else
-              echo "⚠️ Could not find any target daemons to trace after restart."
+          # Start packet capture if the interface was found.
+          if [ -n "$TARGET_INTERFACE" ]; then
+              sudo tcpdump -i $TARGET_INTERFACE -w $LOG_DIR/capture.pcap > $LOG_DIR/tcpdump.log 2>&1 &
+              TCPDUMP_PID=$!
           fi
+          
+          # Start the IOCTL fuzzer.
+          # NOTE: The device path /dev/bpf0 is a guess for a generic packet interface.
+          # On a dedicated test machine, this may need to be changed.
+          echo "[*] Launching IOCTL fuzzer against /dev/bpf0 for 60 seconds..."
+          sudo ./ioctl_fuzzer /dev/bpf0 > "$LOG_DIR/fuzzer.log" 2>&1 &
+          FUZZER_PID=$!
 
-          sleep 90
+          sleep 60
 
-          echo "[*] Stopping all tracers..."
+          echo "[*] Stopping fuzzer and all tracers..."
+          sudo kill $FUZZER_PID $TCPDUMP_PID || true
           sudo pkill dtruss || true
           
-          # --- DYNAMIC INTERFACE DISCOVERY ---
-          echo "[*] Checking for new network interfaces after trace..."
-          ifconfig -a | grep '^[a-z]' | cut -d':' -f1 | sort > /tmp/interfaces_after.txt
-          NEW_INTERFACE=$(comm -13 /tmp/interfaces_before.txt /tmp/interfaces_after.txt)
-
-          if [ -n "$NEW_INTERFACE" ]; then
-              echo "✅ A new interface was discovered during the trace: $NEW_INTERFACE"
-              ifconfig "$NEW_INTERFACE" > "$LOG_DIR/new_interface_details.txt"
-          else
-              echo "❌ No new network interface was created."
-          fi
-          # --- END DISCOVERY ---
-
-          # --- CLEANUP LOGIC ---
+          # --- Cleanup ---
           echo "[*] Restoring original AirDrop settings..."
           sudo defaults write com.apple.sharingd DiscoverableMode "$ORIGINAL_MODE"
           sudo pkill sharingd
-          echo "    Restored AirDrop mode to '$ORIGINAL_MODE' and restarted sharingd."
-          # --- END CLEANUP LOGIC ---
+          echo "    Restored AirDrop mode to '$ORIGINAL_MODE'."
 
-          echo "✅ Diagnostic trace complete. Logs are in '$LOG_DIR'."
+          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
           ls -l $LOG_DIR
           EOF
-          chmod +x run_trace_session.sh
+          chmod +x run_fuzz_session.sh
 
-      # Step 2: Execute the diagnostic session.
-      - name: Run Diagnostic Tracing Session
-        run: sudo ./run_trace_session.sh
+      # Step 3: Execute the fuzzing session.
+      - name: Run Fuzzing and Tracing Session
+        run: sudo ./run_fuzz_session.sh
 
-      # Step 3: Upload all captured logs as an artifact for analysis.
-      - name: Upload Diagnostic Artifacts
-        if: always() # Ensure logs are uploaded even if a step fails
+      # Step 4: Upload all captured logs as an artifact for analysis.
+      - name: Upload Fuzzing Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: awdl-diagnostic-logs
-          path: diagnostic_trace_logs/
+          name: awdl-ioctl-fuzz-logs
+          path: fuzz_trace_logs/
           retention-days: 7
