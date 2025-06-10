@@ -33,7 +33,8 @@ jobs:
       - name: Install Fuzzer Dependencies
         run: |
           echo "[*] Installing 'six' library for CoreAudioFuzz..."
-          pip3 install six
+          # Use --break-system-packages to handle externally managed Python environments.
+          pip3 install --break-system-packages six
           echo "✅ Dependencies installed."
 
       # Step 4: Create the main session script to orchestrate the fuzzing and tracing.
