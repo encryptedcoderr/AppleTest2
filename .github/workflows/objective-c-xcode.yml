@@ -42,10 +42,20 @@ jobs:
         run: |
           echo "[*] Building Jackalope and TinyInst dependencies..."
           cd jackalope-modifications
+
+          # Fix the main CMakeLists.txt file by adding the required project() command.
+          echo "[*] Patching Jackalope's CMakeLists.txt..."
+          (echo "cmake_minimum_required(VERSION 3.10)" && echo "project(JackalopeFuzzer CXX)" && cat CMakeLists.txt) > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
+
           git clone https://github.com/googleprojectzero/Jackalope.git
           cd Jackalope
           git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
           cd .. # back to jackalope-modifications
+
+          # Fix TinyInst's CMakeLists.txt to update the minimum version requirement.
+          echo "[*] Patching TinyInst's CMakeLists.txt..."
+          sed -i.bak 's/cmake_minimum_required(VERSION 2.8.8)/cmake_minimum_required(VERSION 3.10)/' Jackalope/TinyInst/CMakeLists.txt
+
           mkdir build
           cd build
           cmake -G Xcode ..
