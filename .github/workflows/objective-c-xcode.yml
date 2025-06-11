@@ -1,203 +1,90 @@
-name: CoreAudio Double-Free Fuzzing
+name: Resolve Kernel Symbol Address
+
+# Triggers the workflow on pushes to the main branch or manually from the Actions tab
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch: # Allows manual triggering
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  fuzz-coreaudio:
-    runs-on: macos-latest
+  resolve-symbol-address:
+    name: Resolve IO80211Family Symbol
+    
+    # CRITICAL: This must run on a self-hosted runner with SIP disabled.
+    runs-on: self-hosted
 
     steps:
-      # Step 1: Install build dependencies.
-      - name: Install Dependencies
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Display Xcode Version
+        run: xcodebuild -version
+      
+      - name: 3. Build the Kernel Extension
         run: |
-          echo "[*] Installing CMake..."
-          brew install cmake
-
-      # Step 2: Clone the p0tools repository.
-      - name: Clone p0tools Repository
+          echo "Building SymbolResolver.kext..."
+          # Assumes your Xcode project is named SymbolResolver.xcodeproj
+          xcodebuild -project SymbolResolver.xcodeproj -scheme SymbolResolver -configuration Release build
+        
+      - name: 4. Resolve Symbol Address via Kext
+        id: resolve
         run: |
-          echo "[*] Cloning Google Project Zero's p0tools..."
-          git clone https://github.com/googleprojectzero/p0tools.git
-          echo "✅ Repository cloned."
-
-      # Step 3: Check the runner architecture.
-      - name: Check System Architecture
-        run: |
-          echo "[*] Checking architecture..."
-          uname -m
-
-      # Step 4: Build CoreAudioFuzz and its dependencies.
-      - name: Build CoreAudioFuzz and Dependencies
-        working-directory: p0tools/CoreAudioFuzz
-        run: |
-          echo "[*] Building Jackalope and TinyInst dependencies..."
-          cd jackalope-modifications
-
-          # Patch Jackalope's CMakeLists.txt.
-          echo "[*] Patching Jackalope's CMakeLists.txt..."
-          echo -e "cmake_minimum_required(VERSION 3.10)\nproject(JackalopeFuzzer CXX)\n$(cat CMakeLists.txt)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
-          cat CMakeLists.txt | grep "cmake_minimum_required(VERSION 3.10)" || { echo "❌ Failed to patch Jackalope CMakeLists.txt"; exit 1; }
-
-          # Clone Jackalope and TinyInst.
-          git clone https://github.com/googleprojectzero/Jackalope.git
-          cd Jackalope
-          git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-
-          # Check and patch TinyInst's CMakeLists.txt if necessary.
-          echo "[*] Checking TinyInst's CMakeLists.txt..."
-          TINYINST_CMAKE="TinyInst/CMakeLists.txt"
-          if [ ! -f "$TINYINST_CMAKE" ]; then
-            echo "❌ TinyInst CMakeLists.txt not found at $TINYINST_CMAKE"
+          KEXT_PATH="build/Release/SymbolResolver.kext"
+          LOG_FILE="resolved_symbol.log"
+          
+          echo "--- Preparing to load kext ---"
+          if [ ! -d "$KEXT_PATH" ]; then
+            echo "Kext not found at $KEXT_PATH!"
             exit 1
           fi
-          echo "[*] Current content of TinyInst CMakeLists.txt:"
-          cat "$TINYINST_CMAKE"
-          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$TINYINST_CMAKE"; then
-            echo "[*] TinyInst CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
-          else
-            echo "[*] Patching TinyInst CMakeLists.txt to VERSION 3.10..."
-            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$TINYINST_CMAKE" || {
-              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
-              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $TINYINST_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$TINYINST_CMAKE"
-            }
-            echo "[*] Content of TinyInst CMakeLists.txt after patching:"
-            cat "$TINYINST_CMAKE"
-            grep "cmake_minimum_required(VERSION 3.10)" "$TINYINST_CMAKE" || { echo "❌ Failed to patch TinyInst CMakeLists.txt"; exit 1; }
-          fi
 
-          # Check and patch Jackalope's CMakeLists.txt (in case it’s the source of the error).
-          echo "[*] Checking Jackalope's CMakeLists.txt..."
-          JACKALOPE_CMAKE="CMakeLists.txt"
-          if [ ! -f "$JACKALOPE_CMAKE" ]; then
-            echo "❌ Jackalope CMakeLists.txt not found at $JACKALOPE_CMAKE"
+          # Set correct permissions
+          sudo chown -R root:wheel "$KEXT_PATH"
+          sudo chmod -R 755 "$KEXT_PATH"
+
+          echo "--- Loading kext and capturing log ---"
+          # Load the kext and immediately start listening to the log stream.
+          # We use `timeout` to stop listening after 5 seconds.
+          sudo kextload "$KEXT_PATH" &
+          timeout 5s log stream --predicate 'process == "kernel" and sender == "SymbolResolver"' > "$LOG_FILE"
+          
+          echo "--- Unloading kext ---"
+          sudo kextunload -b com.your-company.SymbolResolver # Use the kext's bundle ID
+
+          echo "--- Parsing log file ---"
+          cat "$LOG_FILE"
+
+          # Grep for the successful log line
+          RESULT_LINE=$(grep '[SymbolResolver] OK:' "$LOG_FILE")
+
+          if [ -z "$RESULT_LINE" ]; then
+            echo "Failed to resolve symbol. Log did not contain successful result."
             exit 1
           fi
-          echo "[*] Current content of Jackalope CMakeLists.txt:"
-          cat "$JACKALOPE_CMAKE"
-          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$JACKALOPE_CMAKE"; then
-            echo "[*] Jackalope CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
-          else
-            echo "[*] Patching Jackalope CMakeLists.txt to VERSION 3.10..."
-            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$JACKALOPE_CMAKE" || {
-              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
-              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $JACKALOPE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$JACKALOPE_CMAKE"
-            }
-            echo "[*] Content of Jackalope CMakeLists.txt after patching:"
-            cat "$JACKALOPE_CMAKE"
-            grep "cmake_minimum_required(VERSION 3.10)" "$JACKALOPE_CMAKE" || { echo "❌ Failed to patch Jackalope CMakeLists.txt"; exit 1; }
+
+          # Parse the address from the line ".... = 0xADDRESS"
+          RESOLVED_ADDRESS=$(echo "$RESULT_LINE" | awk -F '= ' '{print $2}')
+          
+          if [ -z "$RESOLVED_ADDRESS" ]; then
+            echo "Failed to parse address from log line."
+            exit 1
           fi
 
-          # Check and patch third_party submodules (mbuild and xed).
-          echo "[*] Checking third_party CMakeLists.txt files..."
-          for SUBMODULE_CMAKE in TinyInst/third_party/*/CMakeLists.txt; do
-            if [ -f "$SUBMODULE_CMAKE" ]; then
-              echo "[*] Found CMakeLists.txt at $SUBMODULE_CMAKE"
-              echo "[*] Current content of $SUBMODULE_CMAKE:"
-              cat "$SUBMODULE_CMAKE"
-              if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$SUBMODULE_CMAKE"; then
-                echo "[*] $SUBMODULE_CMAKE already has compatible version (>= 3.1), no patching needed."
-              else
-                echo "[*] Patching $SUBMODULE_CMAKE to VERSION 3.10..."
-                sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$SUBMODULE_CMAKE" || {
-                  echo "[*] Sed replacement failed, prepending VERSION 3.10..."
-                  echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $SUBMODULE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$SUBMODULE_CMAKE"
-                }
-                echo "[*] Content of $SUBMODULE_CMAKE after patching:"
-                cat "$SUBMODULE_CMAKE"
-                grep "cmake_minimum_required(VERSION 3.10)" "$SUBMODULE_CMAKE" || { echo "❌ Failed to patch $SUBMODULE_CMAKE"; exit 1; }
-              fi
-            fi
-          done
+          echo "Successfully resolved address: ${RESOLVED_ADDRESS}"
+          
+          # This is how we set an output for subsequent steps/jobs
+          echo "resolved_address=${RESOLVED_ADDRESS}" >> "$GITHUB_OUTPUT"
+          echo "log_content<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$(cat $LOG_FILE)" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-          cd .. # back to jackalope-modifications
+      - name: 5. Display Resolved Address
+        run: echo "The resolved symbol address is ${{ steps.resolve.outputs.resolved_address }}"
 
-          # Build dependencies.
-          mkdir build
-          cd build
-          echo "[*] Running CMake configuration..."
-          cmake -G Xcode .. || { echo "❌ CMake configuration failed"; exit 1; }
-          echo "[*] Building with CMake..."
-          cmake --build . --config Release || { echo "❌ CMake build failed"; exit 1; }
-          cd ../.. # back to CoreAudioFuzz directory
-
-          echo "[*] Building the CoreAudioFuzz harness..."
-          make || { echo "❌ Make failed"; exit 1; }
-
-          echo "✅ Fuzzer and dependencies compiled."
-          echo "[*] Unzipping the provided corpus..."
-          unzip corpus.zip || { echo "❌ Failed to unzip corpus"; exit 1; }
-
-          ls -l
-
-      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
-      - name: Create Fuzzing Session Script
-        run: |
-          echo "Creating run_fuzz_session.sh script..."
-          cat > run_fuzz_session.sh << 'EOF'
-          #!/bin/bash
-          if [ "$EUID" -ne 0 ]; then echo "Please run with sudo."; exit 1; fi
-
-          LOG_DIR="coreaudio_fuzz_logs"
-          mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
-          echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
-
-          # --- Tracing Setup ---
-          echo "[*] Starting system call trace on coreaudiod..."
-          COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
-          if [ -n "$COREAUDIO_PID" ]; then
-              sudo dtruss -p $COREAUDIO_PID -f -d > "$LOG_DIR/dtruss_coreaudiod.log" 2>&1 &
-              DTRUSS_PID=$!
-              echo "    dtruss attached to coreaudiod (PID $COREAUDIO_PID)."
-          else
-              echo "⚠️ coreaudiod not found. Tracing may be incomplete."
-          fi
-
-          # --- Fuzzing Logic ---
-          cd p0tools/CoreAudioFuzz
-          if [ ! -f "./run.sh" ]; then
-              echo "❌ run.sh script not found in CoreAudioFuzz directory!"
-              exit 1
-          fi
-
-          echo "[*] Launching CoreAudioFuzz via run.sh for 90 seconds..."
-          sudo ./run.sh > "../../../$LOG_DIR/fuzzer_output.log" 2>&1 &
-          FUZZER_PID=$!
-
-          cd ../../
-          sleep 90
-
-          echo "[*] Stopping fuzzer and tracers..."
-          sudo kill $FUZZER_PID 2>/dev/null || true
-          sudo pkill -f dtruss 2>/dev/null || true
-
-          echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
-          # Check for any generated crash reports.
-          echo "[*] Checking for crash reports..."
-          CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
-          if [ -n "$CRASH_REPORTS" ]; then
-              echo "🚨 SUCCESS: Crash reports found! Copying to logs directory."
-              sudo cp $CRASH_REPORTS $LOG_DIR/
-          else
-              echo "    No new crash reports found."
-          fi
-
-          ls -l $LOG_DIR
-          EOF
-          chmod +x run_fuzz_session.sh
-
-      # Step 6: Execute the fuzzing session.
-      - name: Run Fuzzing and Tracing Session
-        run: sudo ./run_fuzz_session.sh
-
-      # Step 7: Upload all captured logs and crash reports as an artifact.
-      - name: Upload Fuzzing Artifacts
-        if: always()
+      - name: 6. Upload Results as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coreaudio-fuzzing-logs
-          path: coreaudio_fuzz_logs/
-          retention-days: 7
+          name: symbol-resolution-results
+          path: |
+            build/Release/SymbolResolver.kext
+            resolved_symbol.log
