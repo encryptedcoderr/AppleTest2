@@ -4,7 +4,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
   fuzz-coreaudio:
@@ -48,10 +48,28 @@ jobs:
           git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
           cd .. # back to jackalope-modifications
 
-          # Patch TinyInst's CMakeLists.txt.
-          echo "[*] Patching TinyInst's CMakeLists.txt..."
-          sed -i.bak 's/cmake_minimum_required(VERSION 2.8.8)/cmake_minimum_required(VERSION 3.10)/' Jackalope/TinyInst/CMakeLists.txt
-          cat Jackalope/TinyInst/CMakeLists.txt | grep "cmake_minimum_required(VERSION 3.10)" || { echo "❌ Failed to patch TinyInst CMakeLists.txt"; exit 1; }
+          # Check and patch TinyInst's CMakeLists.txt if necessary.
+          echo "[*] Checking TinyInst's CMakeLists.txt..."
+          TINYINST_CMAKE="Jackalope/TinyInst/CMakeLists.txt"
+          if [ ! -f "$TINYINST_CMAKE" ]; then
+            echo "❌ TinyInst CMakeLists.txt not found at $TINYINST_CMAKE"
+            exit 1
+          fi
+          echo "[*] Current content of TinyInst CMakeLists.txt:"
+          cat "$TINYINST_CMAKE"
+          # Check if cmake_minimum_required is >= 3.1
+          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$TINYINST_CMAKE"; then
+            echo "[*] TinyInst CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
+          else
+            echo "[*] Patching TinyInst CMakeLists.txt to VERSION 3.10..."
+            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$TINYINST_CMAKE" || {
+              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $TINYINST_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$TINYINST_CMAKE"
+            }
+            echo "[*] Content of TinyInst CMakeLists.txt after patching:"
+            cat "$TINYINST_CMAKE"
+            grep "cmake_minimum_required(VERSION 3.10)" "$TINYINST_CMAKE" || { echo "❌ Failed to patch TinyInst CMakeLists.txt"; exit 1; }
+          fi
 
           # Build dependencies.
           mkdir build
@@ -71,7 +89,7 @@ jobs:
 
           ls -l
 
-      # Step 5: Create the main session script.
+      # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
       - name: Create Fuzzing Session Script
         run: |
           echo "Creating run_fuzz_session.sh script..."
@@ -83,7 +101,7 @@ jobs:
           mkdir -p $LOG_DIR && rm -f $LOG_DIR/*
           echo "--- CoreAudio Fuzzing Session Started: $(date) ---" | tee $LOG_DIR/session.log
 
-          # Tracing Setup
+          # --- Tracing Setup ---
           echo "[*] Starting system call trace on coreaudiod..."
           COREAUDIO_PID=$(pgrep -x coreaudiod || echo "")
           if [ -n "$COREAUDIO_PID" ]; then
@@ -94,7 +112,7 @@ jobs:
               echo "⚠️ coreaudiod not found. Tracing may be incomplete."
           fi
 
-          # Fuzzing Logic
+          # --- Fuzzing Logic ---
           cd p0tools/CoreAudioFuzz
           if [ ! -f "./run.sh" ]; then
               echo "❌ run.sh script not found in CoreAudioFuzz directory!"
@@ -113,6 +131,7 @@ jobs:
           sudo pkill -f dtruss 2>/dev/null || true
 
           echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
+          # Check for any generated crash reports.
           echo "[*] Checking for crash reports..."
           CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
           if [ -n "$CRASH_REPORTS" ]; then
@@ -130,7 +149,7 @@ jobs:
       - name: Run Fuzzing and Tracing Session
         run: sudo ./run_fuzz_session.sh
 
-      # Step 7: Upload logs and crash reports.
+      # Step 7: Upload all captured logs and crash reports as an artifact.
       - name: Upload Fuzzing Artifacts
         if: always()
         uses: actions/upload-artifact@v4
