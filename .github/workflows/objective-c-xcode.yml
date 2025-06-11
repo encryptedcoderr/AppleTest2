@@ -46,18 +46,16 @@ jobs:
           git clone https://github.com/googleprojectzero/Jackalope.git
           cd Jackalope
           git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-          cd .. # back to jackalope-modifications
 
           # Check and patch TinyInst's CMakeLists.txt if necessary.
           echo "[*] Checking TinyInst's CMakeLists.txt..."
-          TINYINST_CMAKE="Jackalope/TinyInst/CMakeLists.txt"
+          TINYINST_CMAKE="TinyInst/CMakeLists.txt"
           if [ ! -f "$TINYINST_CMAKE" ]; then
             echo "❌ TinyInst CMakeLists.txt not found at $TINYINST_CMAKE"
             exit 1
           fi
           echo "[*] Current content of TinyInst CMakeLists.txt:"
           cat "$TINYINST_CMAKE"
-          # Check if cmake_minimum_required is >= 3.1
           if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$TINYINST_CMAKE"; then
             echo "[*] TinyInst CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
           else
@@ -70,6 +68,52 @@ jobs:
             cat "$TINYINST_CMAKE"
             grep "cmake_minimum_required(VERSION 3.10)" "$TINYINST_CMAKE" || { echo "❌ Failed to patch TinyInst CMakeLists.txt"; exit 1; }
           fi
+
+          # Check and patch Jackalope's CMakeLists.txt (in case it’s the source of the error).
+          echo "[*] Checking Jackalope's CMakeLists.txt..."
+          JACKALOPE_CMAKE="CMakeLists.txt"
+          if [ ! -f "$JACKALOPE_CMAKE" ]; then
+            echo "❌ Jackalope CMakeLists.txt not found at $JACKALOPE_CMAKE"
+            exit 1
+          fi
+          echo "[*] Current content of Jackalope CMakeLists.txt:"
+          cat "$JACKALOPE_CMAKE"
+          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$JACKALOPE_CMAKE"; then
+            echo "[*] Jackalope CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
+          else
+            echo "[*] Patching Jackalope CMakeLists.txt to VERSION 3.10..."
+            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$JACKALOPE_CMAKE" || {
+              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $JACKALOPE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$JACKALOPE_CMAKE"
+            }
+            echo "[*] Content of Jackalope CMakeLists.txt after patching:"
+            cat "$JACKALOPE_CMAKE"
+            grep "cmake_minimum_required(VERSION 3.10)" "$JACKALOPE_CMAKE" || { echo "❌ Failed to patch Jackalope CMakeLists.txt"; exit 1; }
+          fi
+
+          # Check and patch third_party submodules (mbuild and xed).
+          echo "[*] Checking third_party CMakeLists.txt files..."
+          for SUBMODULE_CMAKE in TinyInst/third_party/*/CMakeLists.txt; do
+            if [ -f "$SUBMODULE_CMAKE" ]; then
+              echo "[*] Found CMakeLists.txt at $SUBMODULE_CMAKE"
+              echo "[*] Current content of $SUBMODULE_CMAKE:"
+              cat "$SUBMODULE_CMAKE"
+              if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$SUBMODULE_CMAKE"; then
+                echo "[*] $SUBMODULE_CMAKE already has compatible version (>= 3.1), no patching needed."
+              else
+                echo "[*] Patching $SUBMODULE_CMAKE to VERSION 3.10..."
+                sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$SUBMODULE_CMAKE" || {
+                  echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+                  echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $SUBMODULE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$SUBMODULE_CMAKE"
+                }
+                echo "[*] Content of $SUBMODULE_CMAKE after patching:"
+                cat "$SUBMODULE_CMAKE"
+                grep "cmake_minimum_required(VERSION 3.10)" "$SUBMODULE_CMAKE" || { echo "❌ Failed to patch $SUBMODULE_CMAKE"; exit 1; }
+              fi
+            fi
+          done
+
+          cd .. # back to jackalope-modifications
 
           # Build dependencies.
           mkdir build
