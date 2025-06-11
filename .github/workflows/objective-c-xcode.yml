@@ -1,9 +1,3 @@
-# This workflow uses the Google Project Zero CoreAudioFuzz tool to find
-# double-free and other memory corruption vulnerabilities in macOS audio services.
-# It sets up the environment, builds all dependencies (Jackalope, TinyInst),
-# runs the fuzzer as intended by the authors, and traces relevant daemons
-# to capture a full diagnostic picture.
-
 name: CoreAudio Double-Free Fuzzing
 on:
   push:
@@ -29,51 +23,114 @@ jobs:
           echo "[*] Cloning Google Project Zero's p0tools..."
           git clone https://github.com/googleprojectzero/p0tools.git
           echo "✅ Repository cloned."
-      
-      # Step 3: Check the runner architecture, as some tools are x86-specific.
+
+      # Step 3: Check the runner architecture.
       - name: Check System Architecture
         run: |
           echo "[*] Checking architecture..."
           uname -m
 
-      # Step 4: Build CoreAudioFuzz and its dependencies per the README.
+      # Step 4: Build CoreAudioFuzz and its dependencies.
       - name: Build CoreAudioFuzz and Dependencies
         working-directory: p0tools/CoreAudioFuzz
         run: |
           echo "[*] Building Jackalope and TinyInst dependencies..."
           cd jackalope-modifications
 
+          # Patch Jackalope's CMakeLists.txt.
+          echo "[*] Patching Jackalope's CMakeLists.txt..."
+          echo -e "cmake_minimum_required(VERSION 3.10)\nproject(JackalopeFuzzer CXX)\n$(cat CMakeLists.txt)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
+          cat CMakeLists.txt | grep "cmake_minimum_required(VERSION 3.10)" || { echo "❌ Failed to patch Jackalope CMakeLists.txt"; exit 1; }
+
+          # Clone Jackalope and TinyInst.
           git clone https://github.com/googleprojectzero/Jackalope.git
           cd Jackalope
           git clone --recurse-submodules https://github.com/googleprojectzero/TinyInst.git
-          cd .. # back to jackalope-modifications
-          
-          # --- NEW: Robust CMake Patching ---
-          # The dependencies use outdated CMake versions. This step patches them.
-          echo "[*] Patching CMakeLists.txt files for compatibility..."
-          
-          # Patch the top-level jackalope-modifications CMakeLists.txt
-          (echo "cmake_minimum_required(VERSION 3.10)" && echo "project(JackalopeFuzzer CXX)" && cat CMakeLists.txt) > temp_CMakeLists.txt && mv temp_CMakeLists.txt CMakeLists.txt
-          
-          # Patch the TinyInst dependency's CMakeLists.txt
-          sed -i.bak 's/cmake_minimum_required(VERSION "3.1")/cmake_minimum_required(VERSION 3.10)/' Jackalope/TinyInst/CMakeLists.txt
-          
-          echo "[*] Patches applied. Proceeding with build..."
-          # --- END PATCHING ---
 
+          # Check and patch TinyInst's CMakeLists.txt if necessary.
+          echo "[*] Checking TinyInst's CMakeLists.txt..."
+          TINYINST_CMAKE="TinyInst/CMakeLists.txt"
+          if [ ! -f "$TINYINST_CMAKE" ]; then
+            echo "❌ TinyInst CMakeLists.txt not found at $TINYINST_CMAKE"
+            exit 1
+          fi
+          echo "[*] Current content of TinyInst CMakeLists.txt:"
+          cat "$TINYINST_CMAKE"
+          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$TINYINST_CMAKE"; then
+            echo "[*] TinyInst CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
+          else
+            echo "[*] Patching TinyInst CMakeLists.txt to VERSION 3.10..."
+            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$TINYINST_CMAKE" || {
+              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $TINYINST_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$TINYINST_CMAKE"
+            }
+            echo "[*] Content of TinyInst CMakeLists.txt after patching:"
+            cat "$TINYINST_CMAKE"
+            grep "cmake_minimum_required(VERSION 3.10)" "$TINYINST_CMAKE" || { echo "❌ Failed to patch TinyInst CMakeLists.txt"; exit 1; }
+          fi
+
+          # Check and patch Jackalope's CMakeLists.txt (in case it’s the source of the error).
+          echo "[*] Checking Jackalope's CMakeLists.txt..."
+          JACKALOPE_CMAKE="CMakeLists.txt"
+          if [ ! -f "$JACKALOPE_CMAKE" ]; then
+            echo "❌ Jackalope CMakeLists.txt not found at $JACKALOPE_CMAKE"
+            exit 1
+          fi
+          echo "[*] Current content of Jackalope CMakeLists.txt:"
+          cat "$JACKALOPE_CMAKE"
+          if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$JACKALOPE_CMAKE"; then
+            echo "[*] Jackalope CMakeLists.txt already has compatible version (>= 3.1), no patching needed."
+          else
+            echo "[*] Patching Jackalope CMakeLists.txt to VERSION 3.10..."
+            sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$JACKALOPE_CMAKE" || {
+              echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+              echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $JACKALOPE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$JACKALOPE_CMAKE"
+            }
+            echo "[*] Content of Jackalope CMakeLists.txt after patching:"
+            cat "$JACKALOPE_CMAKE"
+            grep "cmake_minimum_required(VERSION 3.10)" "$JACKALOPE_CMAKE" || { echo "❌ Failed to patch Jackalope CMakeLists.txt"; exit 1; }
+          fi
+
+          # Check and patch third_party submodules (mbuild and xed).
+          echo "[*] Checking third_party CMakeLists.txt files..."
+          for SUBMODULE_CMAKE in TinyInst/third_party/*/CMakeLists.txt; do
+            if [ -f "$SUBMODULE_CMAKE" ]; then
+              echo "[*] Found CMakeLists.txt at $SUBMODULE_CMAKE"
+              echo "[*] Current content of $SUBMODULE_CMAKE:"
+              cat "$SUBMODULE_CMAKE"
+              if grep -q "cmake_minimum_required(VERSION [\" ]*3\.[1-9][0-9]*" "$SUBMODULE_CMAKE"; then
+                echo "[*] $SUBMODULE_CMAKE already has compatible version (>= 3.1), no patching needed."
+              else
+                echo "[*] Patching $SUBMODULE_CMAKE to VERSION 3.10..."
+                sed -i.bak 's/cmake_minimum_required(VERSION [" ]*[0-9.]*[" ]*)/cmake_minimum_required(VERSION 3.10)/' "$SUBMODULE_CMAKE" || {
+                  echo "[*] Sed replacement failed, prepending VERSION 3.10..."
+                  echo -e "cmake_minimum_required(VERSION 3.10)\n$(cat $SUBMODULE_CMAKE)" > temp_CMakeLists.txt && mv temp_CMakeLists.txt "$SUBMODULE_CMAKE"
+                }
+                echo "[*] Content of $SUBMODULE_CMAKE after patching:"
+                cat "$SUBMODULE_CMAKE"
+                grep "cmake_minimum_required(VERSION 3.10)" "$SUBMODULE_CMAKE" || { echo "❌ Failed to patch $SUBMODULE_CMAKE"; exit 1; }
+              fi
+            fi
+          done
+
+          cd .. # back to jackalope-modifications
+
+          # Build dependencies.
           mkdir build
           cd build
-          cmake -G Xcode ..
-          cmake --build . --config Release
+          echo "[*] Running CMake configuration..."
+          cmake -G Xcode .. || { echo "❌ CMake configuration failed"; exit 1; }
+          echo "[*] Building with CMake..."
+          cmake --build . --config Release || { echo "❌ CMake build failed"; exit 1; }
           cd ../.. # back to CoreAudioFuzz directory
-          
+
           echo "[*] Building the CoreAudioFuzz harness..."
-          make
-          
+          make || { echo "❌ Make failed"; exit 1; }
+
           echo "✅ Fuzzer and dependencies compiled."
           echo "[*] Unzipping the provided corpus..."
-          unzip corpus.zip
-          
+          unzip corpus.zip || { echo "❌ Failed to unzip corpus"; exit 1; }
+
           ls -l
 
       # Step 5: Create the main session script to orchestrate the fuzzing and tracing.
@@ -98,30 +155,27 @@ jobs:
           else
               echo "⚠️ coreaudiod not found. Tracing may be incomplete."
           fi
-          
+
           # --- Fuzzing Logic ---
-          # We now execute the provided run.sh script, which handles the complex fuzzer invocation.
           cd p0tools/CoreAudioFuzz
-          
           if [ ! -f "./run.sh" ]; then
               echo "❌ run.sh script not found in CoreAudioFuzz directory!"
               exit 1
           fi
-          
+
           echo "[*] Launching CoreAudioFuzz via run.sh for 90 seconds..."
           sudo ./run.sh > "../../../$LOG_DIR/fuzzer_output.log" 2>&1 &
           FUZZER_PID=$!
-          
+
           cd ../../
-          
           sleep 90
 
           echo "[*] Stopping fuzzer and tracers..."
-          sudo kill $FUZZER_PID || true
-          sudo pkill -f dtruss || true
-          
+          sudo kill $FUZZER_PID 2>/dev/null || true
+          sudo pkill -f dtruss 2>/dev/null || true
+
           echo "✅ Fuzzing session complete. Logs are in '$LOG_DIR'."
-          # Check for any generated crash reports, which are the primary indicator of success.
+          # Check for any generated crash reports.
           echo "[*] Checking for crash reports..."
           CRASH_REPORTS=$(ls /Library/Logs/DiagnosticReports/*_$(date +%Y-%m-%d)*.crash 2>/dev/null)
           if [ -n "$CRASH_REPORTS" ]; then
