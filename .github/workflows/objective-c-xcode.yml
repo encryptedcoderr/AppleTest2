@@ -1,90 +1,222 @@
-name: Resolve Kernel Symbol Address
+name: Resolve Kernel Symbol From Source
 
-# Triggers the workflow on pushes to the main branch or manually from the Actions tab
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
-  resolve-symbol-address:
-    name: Resolve IO80211Family Symbol
+  build-and-resolve:
+    name: Build and Resolve Symbol From Embedded Source
     
-    # CRITICAL: This must run on a self-hosted runner with SIP disabled.
+    # CRITICAL: This must run on a self-hosted runner with SIP disabled and a matching KDK.
     runs-on: self-hosted
 
     steps:
-      - name: 1. Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: 2. Display Xcode Version
-        run: xcodebuild -version
-      
-      - name: 3. Build the Kernel Extension
+      - name: 1. Display System and KDK Version
         run: |
-          echo "Building SymbolResolver.kext..."
-          # Assumes your Xcode project is named SymbolResolver.xcodeproj
-          xcodebuild -project SymbolResolver.xcodeproj -scheme SymbolResolver -configuration Release build
-        
-      - name: 4. Resolve Symbol Address via Kext
+          sw_vers
+          # Find the installed KDK, this helps in debugging
+          ls -d /Library/Developer/KDKs/*.kext/
+
+      - name: 2. Build Kext From Embedded Source
+        id: build
+        run: |
+          set -e # Exit immediately if a command exits with a non-zero status.
+
+          KEXT_NAME="SymbolResolver.kext"
+          BUNDLE_ID="com.my-company.symbolresolver"
+          SOURCE_FILE="SymbolResolver.cpp"
+          
+          echo "--- Creating kext bundle structure ---"
+          mkdir -p "${KEXT_NAME}/Contents/MacOS"
+
+          echo "--- Writing Info.plist ---"
+          cat << EOF > "${KEXT_NAME}/Contents/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleIdentifier</key>
+              <string>${BUNDLE_ID}</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundlePackageType</key>
+              <string>KEXT</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1.0</string>
+              <key>IOKitPersonalities</key>
+              <dict>
+                  <key>SymbolResolver</key>
+                  <dict>
+                      <key>CFBundleIdentifier</key>
+                      <string>${BUNDLE_ID}</string>
+                      <key>IOClass</key>
+                      <string>SymbolResolver</string>
+                      <key>IOMatchCategory</key>
+                      <string>SymbolResolver</string>
+                      <key>IOProviderClass</key>
+                      <string>IOResources</string>
+                  </dict>
+              </dict>
+              <key>OSBundleLibraries</key>
+              <dict>
+                  <key>com.apple.kpi.bsd</key>
+                  <string>23.0.0</string>
+                  <key>com.apple.kpi.iokit</key>
+                  <string>23.0.0</string>
+                  <key>com.apple.kpi.libkern</key>
+                  <string>23.0.0</string>
+                  <key>com.apple.kpi.mach</key>
+                  <string>23.0.0</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          echo "--- Writing C++ Source Code ---"
+          cat << 'EOF' > ${SOURCE_FILE}
+          #include <IOKit/IOLib.h>
+          #include <IOKit/IOService.h>
+          #include <mach/mach_types.h>
+          #include <mach-o/loader.h>
+          #include <mach-o/nlist.h>
+
+          class SymbolResolver : public IOService {
+              OSDeclareDefaultStructors(SymbolResolver)
+          private:
+              static kmod_info_t* find_kext_info(const char* bundle_id);
+              static mach_vm_address_t find_symbol_address(const kmod_info_t* kext_info, const char* symbol_name);
+          public:
+              virtual bool start(IOService* provider) override;
+          };
+
+          OSDefineMetaClassAndStructors(SymbolResolver, IOService)
+
+          bool SymbolResolver::start(IOService* provider) {
+              if (!super::start(provider)) { return false; }
+              IOLog("[SymbolResolver] Kext loaded. Starting resolution.\n");
+
+              const char* target_kext_id = "com.apple.iokit.IO80211Family";
+              // IMPORTANT: This mangled name can change between macOS versions.
+              // This name is for macOS Sonoma on Apple Silicon. Check yours with `nm`.
+              const char* target_symbol_name = "__ZN15IO80211AWDLPeer21parseAwdlSyncTreeTLVExP6__mbufP21AWDL_SYNC_TREE_STRUCT";
+
+              kmod_info_t* kext_info = find_kext_info(target_kext_id);
+              if (!kext_info) {
+                  IOLog("[SymbolResolver] FAIL: Could not find kext info for %s\n", target_kext_id);
+                  return true;
+              }
+
+              mach_vm_address_t symbol_address = find_symbol_address(kext_info, target_symbol_name);
+              if (symbol_address == 0) {
+                  IOLog("[SymbolResolver] FAIL: %s.%s = NOT_FOUND\n", target_kext_id, target_symbol_name);
+              } else {
+                  IOLog("[SymbolResolver] OK: %s.%s = 0x%llx\n", target_kext_id, target_symbol_name, symbol_address);
+              }
+              return true;
+          }
+
+          kmod_info_t* SymbolResolver::find_kext_info(const char* bundle_id) {
+              extern kmod_info_t* kmod_list;
+              kmod_info_t* current_kext = kmod_list;
+              while (current_kext) {
+                  if (strncmp(current_kext->name, bundle_id, KMOD_MAX_NAME) == 0) {
+                      return current_kext;
+                  }
+                  current_kext = current_kext->next;
+              }
+              return nullptr;
+          }
+
+          mach_vm_address_t SymbolResolver::find_symbol_address(const kmod_info_t* kext_info, const char* symbol_name) {
+              auto base_address = (uint8_t*)kext_info->address;
+              auto header = (mach_header_64*)base_address;
+              if (header->magic != MH_MAGIC_64) { return 0; }
+
+              auto commands = (load_command*)(base_address + sizeof(mach_header_64));
+              symtab_command* symtab_cmd = nullptr;
+              segment_command_64* linkedit_cmd = nullptr;
+
+              for (uint32_t i = 0; i < header->ncmds; ++i) {
+                  if (commands->cmd == LC_SYMTAB) {
+                      symtab_cmd = (symtab_command*)commands;
+                  } else if (commands->cmd == LC_SEGMENT_64) {
+                      if (strcmp(((segment_command_64*)commands)->segname, SEG_LINKEDIT) == 0) {
+                          linkedit_cmd = (segment_command_64*)commands;
+                      }
+                  }
+                  commands = (load_command*)((uint8_t*)commands + commands->cmdsize);
+              }
+
+              if (!symtab_cmd || !linkedit_cmd) { return 0; }
+              auto linkedit_base = (uint8_t*)(linkedit_cmd->vmaddr - linkedit_cmd->fileoff);
+              auto symbol_table = (nlist_64*)(linkedit_base + symtab_cmd->symoff);
+              auto string_table = (char*)(linkedit_base + symtab_cmd->stroff);
+
+              for (uint32_t i = 0; i < symtab_cmd->nsyms; ++i) {
+                  if (symbol_table[i].n_un.n_strx != 0) {
+                      char* current_symbol_name = string_table + symbol_table[i].n_un.n_strx;
+                      if (strcmp(current_symbol_name, symbol_name) == 0 || (current_symbol_name[0] == '_' && strcmp(current_symbol_name + 1, symbol_name) == 0)) {
+                          return symbol_table[i].n_value;
+                      }
+                  }
+              }
+              return 0;
+          }
+          EOF
+
+          echo "--- Compiling kext with clang++ ---"
+          clang++ -std=c++17 -mkernel -fno-exceptions -fno-rtti \
+              -framework IOKit \
+              -o "${KEXT_NAME}/Contents/MacOS/SymbolResolver" \
+              ${SOURCE_FILE}
+          
+          echo "--- Verifying build ---"
+          ls -l "${KEXT_NAME}/Contents/MacOS/"
+          
+          # Set the path to the built kext as a step output
+          echo "kext_path=${KEXT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=${BUNDLE_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: 3. Resolve Symbol Address via Kext
         id: resolve
         run: |
-          KEXT_PATH="build/Release/SymbolResolver.kext"
+          KEXT_PATH="${{ steps.build.outputs.kext_path }}"
+          BUNDLE_ID="${{ steps.build.outputs.bundle_id }}"
           LOG_FILE="resolved_symbol.log"
           
-          echo "--- Preparing to load kext ---"
-          if [ ! -d "$KEXT_PATH" ]; then
-            echo "Kext not found at $KEXT_PATH!"
-            exit 1
-          fi
-
-          # Set correct permissions
+          echo "--- Preparing to load kext at ${KEXT_PATH} ---"
           sudo chown -R root:wheel "$KEXT_PATH"
           sudo chmod -R 755 "$KEXT_PATH"
 
           echo "--- Loading kext and capturing log ---"
-          # Load the kext and immediately start listening to the log stream.
-          # We use `timeout` to stop listening after 5 seconds.
           sudo kextload "$KEXT_PATH" &
           timeout 5s log stream --predicate 'process == "kernel" and sender == "SymbolResolver"' > "$LOG_FILE"
           
           echo "--- Unloading kext ---"
-          sudo kextunload -b com.your-company.SymbolResolver # Use the kext's bundle ID
+          sudo kextunload -b "$BUNDLE_ID"
 
           echo "--- Parsing log file ---"
           cat "$LOG_FILE"
-
-          # Grep for the successful log line
           RESULT_LINE=$(grep '[SymbolResolver] OK:' "$LOG_FILE")
 
           if [ -z "$RESULT_LINE" ]; then
-            echo "Failed to resolve symbol. Log did not contain successful result."
+            echo "Failed to resolve symbol."
             exit 1
           fi
 
-          # Parse the address from the line ".... = 0xADDRESS"
           RESOLVED_ADDRESS=$(echo "$RESULT_LINE" | awk -F '= ' '{print $2}')
-          
-          if [ -z "$RESOLVED_ADDRESS" ]; then
-            echo "Failed to parse address from log line."
-            exit 1
-          fi
-
           echo "Successfully resolved address: ${RESOLVED_ADDRESS}"
           
-          # This is how we set an output for subsequent steps/jobs
           echo "resolved_address=${RESOLVED_ADDRESS}" >> "$GITHUB_OUTPUT"
-          echo "log_content<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$(cat $LOG_FILE)" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: 5. Display Resolved Address
-        run: echo "The resolved symbol address is ${{ steps.resolve.outputs.resolved_address }}"
-
-      - name: 6. Upload Results as Artifact
+      - name: 4. Upload Results as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: symbol-resolution-results
           path: |
-            build/Release/SymbolResolver.kext
+            ${{ steps.build.outputs.kext_path }}
             resolved_symbol.log
