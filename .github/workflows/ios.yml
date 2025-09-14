@@ -60,6 +60,9 @@ jobs:
           
           unzip -q "${OUTPUT_DIR}/artifacts.zip" -d "${OUTPUT_DIR}"
           
+          echo "--- Listing artifact contents for debugging ---"
+          find "${OUTPUT_DIR}" -type f -ls
+          
           echo "artifact_dir=${OUTPUT_DIR}/main" >> "$GITHUB_OUTPUT"
 
       - name: 5. Analyze Instruments Trace
@@ -79,42 +82,40 @@ jobs:
           brew install jq
 
           echo "--- Locating trace folder ---"
-          TRACE_FOLDER=$(ls -d "${TRACE_DIR}"/*.trace 2>/dev/null | head -n 1)
-          if [ -z "${TRACE_FOLDER}" ]; then
-            echo "::error::No .trace folder found in ${TRACE_DIR}"
-            exit 1
-          fi
-          echo "Found trace: ${TRACE_FOLDER}"
-
+          TRACE_FOLDER=$(find "${TRACE_DIR}" -type d -name "*.trace" -maxdepth 1 2>/dev/null | head -n 1)
           mkdir -p "${OUTPUT_DIR}"
-
-          echo "--- Exporting trace data to JSON ---"
-          xcrun xctrace export --input "${TRACE_FOLDER}" --output "${TRACE_REPORT}" --output-type json || {
-            echo "::error::Failed to export trace to JSON"
-            exit 1
-          }
-
-          echo "--- Analyzing trace for memory spikes and OOM ---"
           : > "${SUMMARY_FILE}"
           echo "Trace Analysis Summary" >> "${SUMMARY_FILE}"
           echo "=====================" >> "${SUMMARY_FILE}"
-          echo "Trace Folder: ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
           echo "Timestamp: $(date -u)" >> "${SUMMARY_FILE}"
           echo "" >> "${SUMMARY_FILE}"
 
-          # Extract memory allocation metrics
-          MAX_MEMORY=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .statistics | select(.name == "Live Bytes") | .max // 0' "${TRACE_REPORT}" | sort -nr | head -n 1)
-          echo "Max Live Bytes: ${MAX_MEMORY} bytes" >> "${SUMMARY_FILE}"
-          if [ "${MAX_MEMORY}" -gt 1000000000 ]; then
-            echo "::warning::Potential OOM detected: Max Live Bytes exceeds 1GB (${MAX_MEMORY} bytes)"
-            echo "Potential OOM: Max Live Bytes = ${MAX_MEMORY} bytes (>1GB)" >> "${SUMMARY_FILE}"
+          if [ -n "${TRACE_FOLDER}" ]; then
+            echo "Found trace: ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
+            echo "Found trace: ${TRACE_FOLDER}"
+
+            echo "--- Exporting trace data to JSON ---"
+            if xcrun xctrace export --input "${TRACE_FOLDER}" --output "${TRACE_REPORT}" --output-type json; then
+              echo "--- Analyzing trace for memory spikes and OOM ---"
+              MAX_MEMORY=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .statistics | select(.name == "Live Bytes") | .max // 0' "${TRACE_REPORT}" | sort -nr | head -n 1)
+              echo "Max Live Bytes: ${MAX_MEMORY} bytes" >> "${SUMMARY_FILE}"
+              if [ "${MAX_MEMORY}" -gt 1000000000 ]; then
+                echo "::warning::Potential OOM detected: Max Live Bytes exceeds 1GB (${MAX_MEMORY} bytes)"
+                echo "Potential OOM: Max Live Bytes = ${MAX_MEMORY} bytes (>1GB)" >> "${SUMMARY_FILE}"
+              fi
+
+              MOBILE_SLIDESHOW_ALLOCS=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .allocations[] | select(.process == "MobileSlideShow") | "\(.size) bytes at \(.timestamp)"' "${TRACE_REPORT}" | sort -nr | head -n 10)
+              echo "Top 10 MobileSlideShow Allocations (bytes, timestamp):" >> "${SUMMARY_FILE}"
+              echo "${MOBILE_SLIDESHOW_ALLOCS}" >> "${SUMMARY_FILE}"
+            else
+              echo "::warning::Failed to export trace to JSON"
+              echo "Trace Export Failed: Could not process ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
+            fi
+          else
+            echo "::warning::No .trace folder found in ${TRACE_DIR}"
+            echo "No trace folder found in ${TRACE_DIR}" >> "${SUMMARY_FILE}"
           fi
 
-          # Extract top MobileSlideShow allocations
-          MOBILE_SLIDESHOW_ALLOCS=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .allocations[] | select(.process == "MobileSlideShow") | "\(.size) bytes at \(.timestamp)"' "${TRACE_REPORT}" | sort -nr | head -n 10)
-          echo "Top 10 MobileSlideShow Allocations (bytes, timestamp):" >> "${SUMMARY_FILE}"
-          echo "${MOBILE_SLIDESHOW_ALLOCS}" >> "${SUMMARY_FILE}"
-          
           echo "" >> "${SUMMARY_FILE}"
 
           echo "--- Correlating with logs and JPEG mapping ---"
