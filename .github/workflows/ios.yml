@@ -44,8 +44,6 @@ jobs:
           NDJSON_FILE="ios_simulator_ndjson.log"
           INSTR_DIR="instruments_trace"
 
-          # Update Homebrew and install dependencies
-          brew update
           brew install coreutils jq
 
           echo "--- Finding an available iPhone simulator (iOS 18+) ---"
@@ -60,15 +58,32 @@ jobs:
               echo "::error::No iPhone simulators found."
               exit 1
             fi
+            echo "Selected fallback UDID: ${SIMULATOR_UDID}"
+            xcrun simctl boot "${SIMULATOR_UDID}"
+            BOOT_TIMEOUT=180
+            BOOT_ELAPSED=0
+            while [ $BOOT_ELAPSED -lt $BOOT_TIMEOUT ]; do
+              BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" 2>/dev/null | grep -E "(Status|Finished)")
+              if echo "$BOOT_STATUS" | grep -q "Finished"; then
+                echo "--- Boot complete! ---"
+                break
+              fi
+              if [ $BOOT_ELAPSED -ge 150 ]; then
+                echo "::warning::Simulator boot taking longer than expected (${BOOT_ELAPSED}s)"
+              fi
+              sleep 5
+              BOOT_ELAPSED=$((BOOT_ELAPSED + 5))
+            done
+            if [ $BOOT_ELAPSED -ge $BOOT_TIMEOUT ]; then
+              echo "::error::Simulator failed to boot within ${BOOT_TIMEOUT}s"
+              exit 1
+            fi
+          else
+            xcrun simctl boot "${SIMULATOR_UDID}"
+            xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
+            sleep 10
           fi
-          
           echo "Using UDID: ${SIMULATOR_UDID}"
-          echo "--- Booting simulator ---"
-          xcrun simctl boot "${SIMULATOR_UDID}"
-          xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
-          echo "--- Boot complete! ---"
-          sleep 10
-
 
           echo "--- Uploading JPEGs ---"
           for jpeg in $JPEG_LIST; do
@@ -79,6 +94,17 @@ jobs:
             fi
           done
 
+          echo "--- Launching Photos app ---"
+          if ! xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow > /dev/null 2>&1; then
+            echo "::warning::Failed to launch Photos app, proceeding with decode trigger"
+          fi
+          sleep 15
+
+          echo "--- Starting Instruments trace for allocations (OOM detection) ---"
+          mkdir -p "${INSTR_DIR}"
+          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach com.apple.mobileslideshow || echo "::warning::Instruments trace failed, continuing with log capture"
+          sleep 5  # Wait for trace to initialize
+
           echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
           PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
           gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
@@ -86,16 +112,9 @@ jobs:
           
           sleep 5
 
-          echo "--- Launching Photos app and starting Instruments trace for allocations (OOM detection) ---"
-          mkdir -p "${INSTR_DIR}"
-          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}/allocations.trace" --device "${SIMULATOR_UDID}" --launch com.apple.mobileslideshow &
-          INSTR_PID=$!
-          sleep 15
-
-
           echo "--- Triggering decode via Photos app ---"
           NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 15 + 60))  # Increased delay per JPEG
+          PROCESS_DELAY=$((NUM_JPEGS * 20 + 60))  # Increased delay for first boot
           xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
           sleep $PROCESS_DELAY
 
@@ -103,7 +122,7 @@ jobs:
           sleep 60
 
           echo "--- Stopping log/trace capture ---"
-          kill "$LOG_PID" "$INSTR_PID" 2>/dev/null || true
+          kill "$LOG_PID" 2>/dev/null || true
           sleep 5  # Ensure trace closes
 
           echo "--- Shutting down simulator ---"
@@ -120,6 +139,12 @@ jobs:
           
           if log show --predicate 'messageType == error AND (eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV")' --last 20m --style syslog | grep -q "EXC\|SEGV"; then
             echo "::warning::Potential crash detected in faults!"
+          fi
+          
+          if [ -d "${INSTR_DIR}" ] && [ -n "$(ls -A ${INSTR_DIR}/*.trace 2>/dev/null)" ]; then
+            echo "Instruments trace generated: $(ls ${INSTR_DIR}/*.trace)"
+          else
+            echo "::warning::No Instruments trace files generated"
           fi
           
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
