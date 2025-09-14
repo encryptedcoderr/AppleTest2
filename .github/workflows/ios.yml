@@ -43,104 +43,116 @@ jobs:
         id: fuzz_ios
         working-directory: ./main
         run: |
-          set -euo pipefail  # FIXED: Strict error handling
+          set -euo pipefail  # Strict error handling
           JPEG_LIST="${{ steps.generate_jpegs.outputs.jpeg_list }}"
-          LOG_FILE="ios_simulator_errors.log"  # Renamed for errors (not just crashes)
+          LOG_FILE="ios_simulator_errors.log"
+          NDJSON_FILE="ios_simulator_ndjson.log"
+          INSTR_TRACE="allocations.trace"
 
-          # FIXED: Install coreutils and jq for gtimeout and JSON parsing
+          # Install dependencies
           brew install coreutils jq
 
-          echo "--- Finding an available iPhone simulator ---"
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
+          echo "--- Finding an available iPhone simulator (iOS 18+) ---"
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false) and (.runtime? | contains("iOS-18") // false)) | .udid' | head -n 1)
           
           if [ -z "$SIMULATOR_UDID" ]; then
-            echo "--- No available simulators found. Full JSON debug: ---"
-            xcrun simctl list devices available -j
-            echo "--- Booting first iPhone simulator as fallback ---"
-            SIMULATOR_UDID=$(xcrun simctl list devices -j | jq -r '.devices | .[] | .[] | select(.name? | startswith("iPhone") // false) | .udid' | head -n 1)
+            echo "--- No iOS 18+ available; fallback to latest iPhone ---"
+            SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
             if [ -z "$SIMULATOR_UDID" ]; then
-              echo "::error::No iPhone simulators found at all."
+              echo "::error::No iPhone simulators found."
               exit 1
             fi
-            echo "Selected fallback UDID: ${SIMULATOR_UDID}"
             xcrun simctl boot "${SIMULATOR_UDID}"
-            # Poll boot until "Finished"
-            echo "--- Monitoring boot until complete (up to 120s) ---"
-            BOOT_TIMEOUT=120
+            # Extended boot poll
+            BOOT_TIMEOUT=180
             BOOT_ELAPSED=0
             while [ $BOOT_ELAPSED -lt $BOOT_TIMEOUT ]; do
               BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" | grep -E "(Status|Finished)")
-              if echo "$BOOT_STATUS" | grep -q "Status=4294967295\|Finished"; then
+              if echo "$BOOT_STATUS" | grep -q "Finished"; then
                 echo "--- Boot complete! ---"
                 break
               fi
               sleep 5
               BOOT_ELAPSED=$((BOOT_ELAPSED + 5))
-              echo "--- Boot progress: $BOOT_ELAPSED s ---"
             done
-            if [ $BOOT_ELAPSED -ge $BOOT_TIMEOUT ]; then
-              echo "::warning::Boot timed out; proceeding."
-            fi
           else
-            echo "--- Booting available simulator (UDID: ${SIMULATOR_UDID}) ---"
             xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
             sleep 10
           fi
+          echo "Using UDID: ${SIMULATOR_UDID}"
 
-          # Upload all JPEGs to Photos library
-          echo "--- Uploading all malicious JPEGs to simulator's Photos library ---"
+          # Upload JPEGs and track DCIM paths
+          echo "--- Uploading JPEGs and noting DCIM paths ---"
+          DCIM_PATHS=""
           for jpeg in $JPEG_LIST; do
-            xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg"
-            echo "Uploaded: $jpeg"
+            if xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" >> /dev/null 2>&1; then
+              echo "Uploaded: $jpeg"
+              # Post-upload DCIM path (approx; actual IMG_XXXX.JPG)
+              DCIM_PATH="/var/mobile/Media/DCIM/100APPLE/$(basename $jpeg)"
+              DCIM_PATHS="${DCIM_PATHS} $DCIM_PATH"
+            else
+              echo "Upload skipped for $jpeg"
+            fi
           done
+          echo "DCIM paths: $DCIM_PATHS"
 
-          echo "--- Starting system log capture (broader for errors) ---"
-          # FIXED: Valid predicate (removed invalid eventType == faultEvent; kept messageType for faults/errors); added --info --debug
-          PREDICATE='subsystem == "com.apple.photos" OR process == "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode"'
-          gtimeout 120s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --info --debug --predicate "$PREDICATE" > "$LOG_FILE" &
+          echo "--- Starting Instruments trace for allocations (OOM detection) ---"
+          xcrun xctrace run "${SIMULATOR_UDID}" --template "Allocations" --attachments "${INSTR_TRACE}" --launchApp com.apple.mobileslideshow &
+          INSTR_PID=$!
+
+          echo "--- Starting system log capture (enhanced for ImageIO faults/crashes) ---"
+          # Enhanced predicate: ImageIO, faults, crashes, specific errors
+          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
+          gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --info --debug --fault --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" &
           LOG_PID=$!
           
-          sleep 5 # Logger init
+          sleep 5
 
           echo "--- Launching Photos app ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
-          sleep 10  # Let app load
+          sleep 10
 
-          # FIXED: Replace AppleScript loop with URL scheme to Recents (triggers decode in simulator Photos app; no heredoc issues)
-          echo "--- Opening Recents in Photos app to trigger decode for all JPEGs ---"
+          echo "--- Triggering decode: Recents URL + fallback direct open ---"
           NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 5 + 30))  # 5s per JPEG + buffer
-          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL scheme failed; relying on app launch + delay"
-          sleep $PROCESS_DELAY  # Time for batch decode in Recents
+          PROCESS_DELAY=$((NUM_JPEGS * 10 + 60))  # 10s per JPEG + buffer
+          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL fallback to app load"
+          # Fallback: Direct open via spawn (forces decode)
+          for dcim in $DCIM_PATHS; do
+            xcrun simctl spawn "${SIMULATOR_UDID}" open "$dcim" || echo "Direct open skipped for $dcim"
+            sleep 10  # Per-file decode time
+          done
+          sleep $PROCESS_DELAY
 
-          echo "--- Waiting additional time for reliable logging ---"
-          sleep 60  # Buffer for errors
+          echo "--- Additional buffer for async faults ---"
+          sleep 60
 
-          echo "--- Stopping log capture ---"
-          kill "$LOG_PID" 2>/dev/null || true
+          echo "--- Stopping log/trace capture ---"
+          kill "$LOG_PID" "$INSTR_PID" 2>/dev/null || true
 
-          echo "--- Shutting down the simulator ---"
+          echo "--- Shutting down simulator ---"
           xcrun simctl shutdown "${SIMULATOR_UDID}"
 
-          echo "--- Log capture complete. Log content: ---"
-          if [ -f "$LOG_FILE" ]; then
-            cat "$LOG_FILE"
-            # FIXED: If empty, check system logs with valid predicate (15m window)
-            if [ ! -s "$LOG_FILE" ]; then
-              echo "--- No logs from stream; checking system logs for JPEG errors ---"
-              log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == fault OR messageType == error' --last 15m --info --debug --style syslog | head -100
-            fi
-          else
-            echo "No log file generated."
-            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR messageType == fault OR messageType == error' --last 15m --info --debug --style syslog | head -100
+          echo "--- Log capture complete. NDJSON content: ---"
+          cat "$NDJSON_FILE"
+          # Fallback if empty: Extended log show for faults
+          if [ ! -s "$NDJSON_FILE" ]; then
+            echo "--- No stream logs; fallback search (20m) ---"
+            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "Tungsten" OR eventMessage CONTAINS "EXC"' --last 20m --info --debug --fault --style syslog | head -200
           fi
           
-          # Set paths as outputs for the artifact upload step
+          # Check for crashes
+          if log show --predicate 'messageType == fault' --last 20m | grep -q "fault"; then
+            echo "::warning::Potential crash detected in faults!"
+          fi
+          
+          # Outputs
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
+          echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
+          echo "instr_path=${INSTR_TRACE}" >> "$GITHUB_OUTPUT"
           echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+          echo "dcim_paths=${DCIM_PATHS}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
-        # This step runs even if a previous step fails, ensuring you always get the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -148,3 +160,5 @@ jobs:
           path: |
             main/${{ steps.fuzz_ios.outputs.jpeg_dir }}
             main/${{ steps.fuzz_ios.outputs.log_path }}
+            main/${{ steps.fuzz_ios.outputs.ndjson_path }}
+            main/${{ steps.fuzz_ios.outputs.instr_path }}
