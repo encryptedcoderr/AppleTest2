@@ -66,10 +66,23 @@ jobs:
             fi
             echo "Selected fallback UDID: ${SIMULATOR_UDID}"
             xcrun simctl boot "${SIMULATOR_UDID}"
-            sleep 20  # Increased wait for boot (Shutdown devices take longer)
-            # Verify boot status
-            BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}")
-            echo "Boot status: ${BOOT_STATUS}"
+            # FIXED: Poll bootstatus until "Finished" (handles data migration delay)
+            echo "--- Monitoring boot until complete (up to 120s) ---"
+            BOOT_TIMEOUT=120
+            BOOT_ELAPSED=0
+            while [ $BOOT_ELAPSED -lt $BOOT_TIMEOUT ]; do
+              BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" | grep -E "(Status|Finished)")
+              if echo "$BOOT_STATUS" | grep -q "Status=4294967295\|Finished"; then
+                echo "--- Boot complete! ---"
+                break
+              fi
+              sleep 5
+              BOOT_ELAPSED=$((BOOT_ELAPSED + 5))
+              echo "--- Boot progress: $BOOT_ELAPSED s ---"
+            done
+            if [ $BOOT_ELAPSED -ge $BOOT_TIMEOUT ]; then
+              echo "::warning::Boot timed out after 120s; proceeding anyway."
+            fi
           else
             echo "--- Booting available simulator (UDID: ${SIMULATOR_UDID}) ---"
             xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
@@ -80,21 +93,26 @@ jobs:
           xcrun simctl addmedia "${SIMULATOR_UDID}" "$JPEG_PATH"
 
           echo "--- Starting system log capture... ---"
-          # Start 'log stream' in the background to capture logs from the simulator
-          # This predicate filters for logs from the Photos app (MobileSlideShow) or any system-level crash report
-          timeout 30s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'process == "MobileSlideShow" or eventType == crash' > "$LOG_FILE" &
+          # FIXED: Broader predicate for errors (not just crash/fault; includes Photos subsystem and general errors)
+          # Use background sleep + kill instead of timeout (macOS compatible)
+          xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'subsystem == "com.apple.photos" or process == "MobileSlideShow" or eventType == error or eventType == fault or eventType == crash' > "$LOG_FILE" &
           LOG_PID=$!
+          
+          # FIXED: Kill after 80s (20s capture + 60s delay) using sleep + kill (no timeout needed)
+          (sleep 80 && kill "$LOG_PID" 2>/dev/null || true) &
+          KILL_PID=$!
           
           sleep 5 # Give the logger a moment to initialize
 
           echo "--- Launching Photos app to trigger the file open ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
 
-          echo "--- Waiting 15 seconds for potential crash to be logged ---"
-          sleep 15
+          echo "--- Waiting 60 seconds for reliable logging (errors/crashes) ---"
+          sleep 60  # FIXED: 60s delay for full interaction/error capture
 
           echo "--- Stopping log capture ---"
-          kill "$LOG_PID" 2>/dev/null || true # Cleanly stop the log stream process
+          kill "$LOG_PID" 2>/dev/null || true
+          kill "$KILL_PID" 2>/dev/null || true # Clean up kill process
 
           echo "--- Shutting down the simulator ---"
           xcrun simctl shutdown "${SIMULATOR_UDID}"
@@ -102,8 +120,15 @@ jobs:
           echo "--- Log capture complete. Log content: ---"
           if [ -f "$LOG_FILE" ]; then
             cat "$LOG_FILE"
+            # FIXED: If empty, grep system logs for JPEG/Photos errors
+            if [ ! -s "$LOG_FILE" ]; then
+              echo "--- No logs from stream; checking system logs for JPEG errors ---"
+              log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos" or eventMessage CONTAINS "MobileSlideShow"' --last 5m --info --debug --style syslog | head -50
+            fi
           else
             echo "No log file generated."
+            # Fallback grep
+            log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos"' --last 5m --info --debug --style syslog | head -50
           fi
           
           # Set paths as outputs for the artifact upload step
