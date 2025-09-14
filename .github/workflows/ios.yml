@@ -58,12 +58,19 @@ jobs:
             exit 1
           fi
           
+          echo "--- Unzipping artifact ---"
           unzip -q "${OUTPUT_DIR}/artifacts.zip" -d "${OUTPUT_DIR}"
           
           echo "--- Listing artifact contents for debugging ---"
           find "${OUTPUT_DIR}" -type f -ls
+          find "${OUTPUT_DIR}" -type d -name "*.trace"
+          FILE_COUNT=$(find "${OUTPUT_DIR}" -type f | wc -l)
+          echo "Total files in artifact: ${FILE_COUNT}"
+          if [ "${FILE_COUNT}" -lt 200 ]; then
+            echo "::warning::Expected ~221 files, found ${FILE_COUNT}. Artifact may be incomplete."
+          fi
           
-          echo "artifact_dir=${OUTPUT_DIR}/main" >> "$GITHUB_OUTPUT"
+          echo "artifact_dir=${OUTPUT_DIR}" >> "$GITHUB_OUTPUT"
 
       - name: 5. Analyze Instruments Trace
         id: analyze_trace
@@ -71,10 +78,9 @@ jobs:
         run: |
           set -euo pipefail
           ARTIFACT_DIR="${{ steps.download_artifact.outputs.artifact_dir }}"
-          TRACE_DIR="${ARTIFACT_DIR}/instruments_trace"
-          LOG_FILE="${ARTIFACT_DIR}/ios_simulator_errors.log"
-          NDJSON_FILE="${ARTIFACT_DIR}/ios_simulator_ndjson.log"
-          JPEG_MAPPING="${ARTIFACT_DIR}/jpeg_mapping.txt"
+          LOG_FILE=$(find "${ARTIFACT_DIR}" -type f -name "ios_simulator_errors.log" | head -n 1)
+          NDJSON_FILE=$(find "${ARTIFACT_DIR}" -type f -name "ios_simulator_ndjson.log" | head -n 1)
+          JPEG_MAPPING=$(find "${ARTIFACT_DIR}" -type f -name "jpeg_mapping.txt" | head -n 1)
           OUTPUT_DIR="trace_analysis"
           TRACE_REPORT="${OUTPUT_DIR}/trace_report.json"
           SUMMARY_FILE="${OUTPUT_DIR}/analysis_summary.txt"
@@ -82,7 +88,7 @@ jobs:
           brew install jq
 
           echo "--- Locating trace folder ---"
-          TRACE_FOLDER=$(find "${TRACE_DIR}" -type d -name "*.trace" -maxdepth 1 2>/dev/null | head -n 1)
+          TRACE_FOLDER=$(find "${ARTIFACT_DIR}" -type d -name "*.trace" | head -n 1)
           mkdir -p "${OUTPUT_DIR}"
           : > "${SUMMARY_FILE}"
           echo "Trace Analysis Summary" >> "${SUMMARY_FILE}"
@@ -112,17 +118,17 @@ jobs:
               echo "Trace Export Failed: Could not process ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
             fi
           else
-            echo "::warning::No .trace folder found in ${TRACE_DIR}"
-            echo "No trace folder found in ${TRACE_DIR}" >> "${SUMMARY_FILE}"
+            echo "::warning::No .trace folder found in ${ARTIFACT_DIR}"
+            echo "No trace folder found in ${ARTIFACT_DIR}" >> "${SUMMARY_FILE}"
           fi
 
           echo "" >> "${SUMMARY_FILE}"
 
           echo "--- Correlating with logs and JPEG mapping ---"
-          if [ -f "${NDJSON_FILE}" ]; then
+          if [ -n "${NDJSON_FILE}" ] && [ -f "${NDJSON_FILE}" ]; then
             echo "Log Errors (from ios_simulator_ndjson.log):" >> "${SUMMARY_FILE}"
             jq -r '. | select(.eventMessage | test("error|EXC|SEGV|Too large image|ImageIO|Tungsten")) | "\(.timestamp) \(.eventMessage)"' "${NDJSON_FILE}" | head -n 20 >> "${SUMMARY_FILE}"
-          elif [ -f "${LOG_FILE}" ]; then
+          elif [ -n "${LOG_FILE}" ] && [ -f "${LOG_FILE}" ]; then
             echo "Log Errors (from ios_simulator_errors.log):" >> "${SUMMARY_FILE}"
             grep -E "error|EXC|SEGV|Too large image|ImageIO|Tungsten" "${LOG_FILE}" | head -n 20 >> "${SUMMARY_FILE}"
           else
@@ -131,7 +137,7 @@ jobs:
 
           echo "" >> "${SUMMARY_FILE}"
 
-          if [ -f "${JPEG_MAPPING}" ]; then
+          if [ -n "${JPEG_MAPPING}" ] && [ -f "${JPEG_MAPPING}" ]; then
             echo "JPEG to DCIM Mapping:" >> "${SUMMARY_FILE}"
             cat "${JPEG_MAPPING}" >> "${SUMMARY_FILE}"
           else
@@ -152,7 +158,7 @@ jobs:
           name: trace-analysis-results-${{ github.run_id }}
           path: |
             main/${{ steps.analyze_trace.outputs.output_dir }}
-            main/${{ steps.download_artifact.outputs.artifact_dir }}/instruments_trace
-            main/${{ steps.download_artifact.outputs.artifact_dir }}/ios_simulator_errors.log
-            main/${{ steps.download_artifact.outputs.artifact_dir }}/ios_simulator_ndjson.log
-            main/${{ steps.download_artifact.outputs.artifact_dir }}/jpeg_mapping.txt
+            main/fuzzing_artifacts/*/instruments_trace
+            main/fuzzing_artifacts/*/ios_simulator_errors.log
+            main/fuzzing_artifacts/*/ios_simulator_ndjson.log
+            main/fuzzing_artifacts/*/jpeg_mapping.txt
