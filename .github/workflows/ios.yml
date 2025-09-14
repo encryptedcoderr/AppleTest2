@@ -95,14 +95,30 @@ jobs:
           done
 
           echo "--- Launching Photos app ---"
-          if ! xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow > /dev/null 2>&1; then
-            echo "::warning::Failed to launch Photos app, proceeding with decode trigger"
+          LAUNCH_ATTEMPTS=3
+          LAUNCH_SUCCESS=0
+          for attempt in $(seq 1 $LAUNCH_ATTEMPTS); do
+            echo "Launch attempt $attempt of $LAUNCH_ATTEMPTS"
+            LAUNCH_OUTPUT=$(xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow 2>&1 || true)
+            if echo "$LAUNCH_OUTPUT" | grep -q "com.apple.mobileslideshow:"; then
+              echo "Photos app launched: $LAUNCH_OUTPUT"
+              LAUNCH_SUCCESS=1
+              break
+            fi
+            echo "Launch failed: $LAUNCH_OUTPUT"
+            sleep 10
+          done
+          if [ $LAUNCH_SUCCESS -eq 0 ]; then
+            echo "::warning::Failed to launch Photos app after $LAUNCH_ATTEMPTS attempts, proceeding with decode trigger"
           fi
-          sleep 15
+          sleep 30  # Increased delay for first boot
 
           echo "--- Starting Instruments trace for allocations (OOM detection) ---"
           mkdir -p "${INSTR_DIR}"
-          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach com.apple.mobileslideshow || echo "::warning::Instruments trace failed, continuing with log capture"
+          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach com.apple.mobileslideshow || echo "::warning::Instruments trace failed, trying all-processes fallback"
+          if [ $? -ne 0 ]; then
+            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
+          fi
           sleep 5  # Wait for trace to initialize
 
           echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
@@ -114,7 +130,7 @@ jobs:
 
           echo "--- Triggering decode via Photos app ---"
           NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 20 + 60))  # Increased delay for first boot
+          PROCESS_DELAY=$((NUM_JPEGS * 20 + 60))  # ~480s for 21 JPEGs
           xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
           sleep $PROCESS_DELAY
 
