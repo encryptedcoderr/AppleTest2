@@ -7,9 +7,6 @@ on:
 jobs:
   fuzz-and-log-ios:
     name: Generate Malicious JPEG and Log Simulator Response
-    
-    # --- THIS IS THE FIX ---
-    # Use a standard, GitHub-provided macOS runner instead of a self-hosted one.
     runs-on: macos-latest
 
     steps:
@@ -31,7 +28,7 @@ jobs:
         working-directory: ./main
         run: |
           python MaliciousJPEGGenerator.py
-          INFO_LEAK_FILE=$(ls malicious_jpegs/exploit_*.jpg | head -n 1)
+          INFO_LEAK_FILE=$(ls malicious_jpegs/exploit*.jpg | head -n 1)
           echo "jpeg_path=${INFO_LEAK_FILE}" >> "$GITHUB_OUTPUT"
           echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
 
@@ -44,7 +41,8 @@ jobs:
           LOG_FILE="ios_simulator_crash.log"
 
           echo "--- Finding an available iPhone simulator ---"
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and .name | startswith("iPhone")) | .udid' | head -n 1)
+          # FIXED: This jq command is more robust and checks the type of the 'name' field before filtering.
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name | type) == "string" and .name | startswith("iPhone")) | .udid' | head -n 1)
           
           if [ -z "$SIMULATOR_UDID" ]; then
             echo "::error::No available iPhone simulators found."
