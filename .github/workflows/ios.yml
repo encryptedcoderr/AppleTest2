@@ -47,8 +47,8 @@ jobs:
           brew install coreutils jq
 
           echo "--- Finding an available iPhone simulator (iOS 18+) ---"
-          # FIXED: Robust jq query for runtime, handles null, matches iOS 18+
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false) and (.runtime? | test("iOS-18-[0-9]"; "i") // false)) | .udid' | head -n 1)
+          # FIXED: Check runtime in parent keys, handle null/missing runtime
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | to_entries[] | select(.key | test("iOS-18-[0-9]"; "i")) | .value[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
           
           if [ -z "$SIMULATOR_UDID" ]; then
             echo "--- No iOS 18+ available; fallback to any iPhone ---"
