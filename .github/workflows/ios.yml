@@ -123,7 +123,7 @@ jobs:
             } else {
                 console.log("No Recents album found.");
             }
-EOF
+
             if [ $? -ne 0 ]; then
               echo "AppleScript failed for $jpeg; continuing anyway."
             fi
