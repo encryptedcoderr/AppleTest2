@@ -94,8 +94,9 @@ jobs:
           done
 
           echo "--- Starting system log capture (broader for errors) ---"
-          # FIXED: Use gtimeout (from coreutils) for macOS compatibility; broader predicate for errors
-          gtimeout 95s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'subsystem == "com.apple.photos" or process == "MobileSlideShow" or eventType == error or eventType == fault or eventType == crash or message CONTAINS "JPEG" or message CONTAINS "decode"' > "$LOG_FILE" &
+          # FIXED: Use valid predicate (no 'eventType == crash'; use faultEvent/error/fault instead); added --debug for verbosity
+          PREDICATE='subsystem == "com.apple.photos" OR process == "MobileSlideShow" OR eventType == faultEvent OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode"'
+          gtimeout 95s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --debug --predicate "$PREDICATE" > "$LOG_FILE" &
           LOG_PID=$!
           
           sleep 5 # Logger init
@@ -103,27 +104,34 @@ jobs:
           echo "--- Launching Photos app ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
 
-          # FIXED: Open each uploaded JPEG to trigger decode (simulate user interaction)
+          # FIXED: Open each uploaded JPEG to trigger decode (simulate user interaction); improved AppleScript for reliability
           echo "--- Opening each uploaded JPEG to trigger potential errors ---"
+          NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
+          TOTAL_DELAY=$((NUM_JPEGS * 8))  # ~8s per JPEG for safety
           for jpeg in $JPEG_LIST; do
             echo "--- Opening $jpeg ---"
-            # Use AppleScript via osascript to open Photos, search, and view the JPEG (by filename or recent)
-            osascript -l JavaScript << EOF
-              var app = Application('Photos');
-              app.activate();
-              delay 2;
-              // Search for recent uploads (assumes JPEG is newest)
-              var results = app.search('recent photos');
-              if (results.length > 0) {
-                results[0].select();
-                delay 3; // Time for decode
-              }
-            EOF
-            echo "Opened/processed $jpeg (waited 3s for decode)."
-            sleep 5  # Per-JPEG delay for sequential processing
+            # Use AppleScript via osascript to open Photos, go to Recents album, and select/view first image (triggers decode)
+            osascript -l JavaScript << 'EOF'
+            var Photos = Application('Photos');
+            Photos.activate();
+            delay 2;
+            // Navigate to Recents Smart Album (uploads go here)
+            var recents = Photos.smartAlbums.whose({name: { _equal: 'Recents' }});
+            if (recents.length > 0) {
+                recents[0].selectedMediaItems[0].select();  // Select first (newest) item
+                delay 4;  // Extra time for decode/render
+            } else {
+                console.log("No Recents album found.");
+            }
+EOF
+            if [ $? -ne 0 ]; then
+              echo "AppleScript failed for $jpeg; continuing anyway."
+            fi
+            echo "Opened/processed $jpeg (waited 4s for decode)."
+            sleep 4  # Per-JPEG delay for sequential processing
           done
 
-          echo "--- Waiting 60 seconds for reliable logging ---"
+          echo "--- Waiting additional time for reliable logging (total ~${TOTAL_DELAY}s activity + 60s buffer) ---"
           sleep 60  # FIXED: 60s total delay for errors
 
           echo "--- Stopping log capture ---"
@@ -135,14 +143,14 @@ jobs:
           echo "--- Log capture complete. Log content: ---"
           if [ -f "$LOG_FILE" ]; then
             cat "$LOG_FILE"
-            # FIXED: If empty, grep system logs for JPEG/Photos/decode errors
+            # FIXED: If empty, grep system logs for JPEG/Photos/decode errors (extended to 15m)
             if [ ! -s "$LOG_FILE" ]; then
               echo "--- No logs from stream; checking system logs for JPEG errors ---"
-              log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos" or eventMessage CONTAINS "decode" or eventMessage CONTAINS "MobileSlideShow"' --last 10m --info --debug --style syslog | head -100
+              log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == fault OR messageType == error' --last 15m --info --debug --style syslog | head -100
             fi
           else
             echo "No log file generated."
-            log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos"' --last 10m --info --debug --style syslog | head -100
+            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR messageType == fault OR messageType == error' --last 15m --info --debug --style syslog | head -100
           fi
           
           # Set paths as outputs for the artifact upload step
