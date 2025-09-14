@@ -122,33 +122,34 @@ jobs:
             echo "::error::Failed to launch Photos app after $LAUNCH_ATTEMPTS attempts"
             exit 1
           fi
-          sleep 45  # Increased delay for first boot
+          sleep 45  # Delay for first boot
 
-          echo "--- Starting Instruments trace for allocations (OOM detection) ---"
+          echo "--- Triggering decode via Photos app ---"
+          NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
+          PROCESS_DELAY=$((NUM_JPEGS * 10 + 60))  # ~270s for 21 JPEGs
+          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
+          sleep 5  # Start decoding before trace
+
+          echo "--- Starting Instruments trace for full execution (OOM detection) ---"
           mkdir -p "${INSTR_DIR}"
           if [ -n "$APP_PID" ]; then
-            if ! xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach "$APP_PID" --time-limit 120s --quiet; then
+            if ! xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach "$APP_PID" --time-limit 540s --quiet; then
               echo "::warning::Instruments trace failed for PID $APP_PID, trying all-processes fallback"
-              xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 120s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
+              xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 540s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
             fi
           else
             echo "::warning::No PID captured, using all-processes fallback"
-            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 120s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
+            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 540s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
           fi
           sleep 5  # Wait for trace to finalize
 
           echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
-          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network"'
-          gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
+          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network" AND NOT process == "SpringBoard"'
+          gtimeout $((PROCESS_DELAY + 60)) xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
           LOG_PID=$!
           
-          sleep 5
-
-          echo "--- Triggering decode via Photos app ---"
-          NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 20 + 60))  # ~480s for 21 JPEGs
-          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
-          sleep $PROCESS_DELAY
+          echo "--- Waiting for JPEG decoding to complete ---"
+          sleep $((PROCESS_DELAY - 5))  # Adjust for early openurl
 
           echo "--- Additional buffer for async faults ---"
           sleep 60
@@ -165,7 +166,7 @@ jobs:
             cat "$NDJSON_FILE"
           else
             echo "--- No stream logs; fallback search (20m) ---"
-            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
+            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network" AND NOT process == "SpringBoard"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
             cat "$LOG_FILE"
           fi
           
@@ -182,7 +183,6 @@ jobs:
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
           echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
           echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
-          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
           echo "jpeg_mapping=${JPEG_MAPPING}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
