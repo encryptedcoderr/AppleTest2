@@ -48,16 +48,26 @@ jobs:
           LOG_FILE="ios_simulator_crash.log"
 
           echo "--- Finding an available iPhone simulator ---"
-          # Find the UDID of the first available, bootable iPhone simulator
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and .name | startswith("iPhone")) | .udid' | head -n 1)
+          # FIXED: Add null check for .name to avoid jq startswith error on null values
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name != null and .name | startswith("iPhone"))) | .udid' | head -n 1)
           
+          # Debug: Log available simulators if none found
           if [ -z "$SIMULATOR_UDID" ]; then
-            echo "::error::No available iPhone simulators found."
-            exit 1
+            echo "--- No available simulators found. Listing all for debug ---"
+            xcrun simctl list devices available
+            echo "--- Booting first iPhone simulator as fallback ---"
+            # Fallback: Boot the first iPhone simulator (even if not available, to make it bootable)
+            SIMULATOR_UDID=$(xcrun simctl list devices -j | jq -r '.devices | .[] | .[] | select(.name != null and .name | startswith("iPhone")) | .udid' | head -n 1)
+            if [ -z "$SIMULATOR_UDID" ]; then
+              echo "::error::No iPhone simulators found at all."
+              exit 1
+            fi
+            xcrun simctl boot "$SIMULATOR_UDID"
+            sleep 10  # Wait for boot
+          else
+            echo "--- Booting simulator (UDID: ${SIMULATOR_UDID}) ---"
+            xcrun simctl bootstatus "$SIMULATOR_UDID" -b
           fi
-          
-          echo "--- Booting simulator (UDID: ${SIMULATOR_UDID}) ---"
-          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
 
           echo "--- Uploading malicious file (${JPEG_PATH}) to the simulator's Photos library ---"
           xcrun simctl addmedia "$SIMULATOR_UDID" "$JPEG_PATH"
