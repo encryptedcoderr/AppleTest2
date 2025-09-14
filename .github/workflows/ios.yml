@@ -48,40 +48,47 @@ jobs:
           LOG_FILE="ios_simulator_crash.log"
 
           echo "--- Finding an available iPhone simulator ---"
-          # FIXED: Add null check for .name to avoid jq startswith error on null values
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name != null and .name | startswith("iPhone"))) | .udid' | head -n 1)
+          # FIXED: Use optional chaining (.name?) to handle nulls safely in startswith
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
           
-          # Debug: Log available simulators if none found
+          # Debug: Log full JSON if none found
           if [ -z "$SIMULATOR_UDID" ]; then
-            echo "--- No available simulators found. Listing all for debug ---"
-            xcrun simctl list devices available
+            echo "--- No available simulators found. Full JSON debug: ---"
+            xcrun simctl list devices available -j
+            echo "--- Listing all devices for fallback selection ---"
+            xcrun simctl list devices
             echo "--- Booting first iPhone simulator as fallback ---"
-            # Fallback: Boot the first iPhone simulator (even if not available, to make it bootable)
-            SIMULATOR_UDID=$(xcrun simctl list devices -j | jq -r '.devices | .[] | .[] | select(.name != null and .name | startswith("iPhone")) | .udid' | head -n 1)
+            # FIXED Fallback: Ignore availability, strict null-safe iPhone filter
+            SIMULATOR_UDID=$(xcrun simctl list devices -j | jq -r '.devices | .[] | .[] | select(.name? | startswith("iPhone") // false) | .udid' | head -n 1)
             if [ -z "$SIMULATOR_UDID" ]; then
-              echo "::error::No iPhone simulators found at all."
+              echo "::error::No iPhone simulators found at all. Check Xcode installation."
               exit 1
             fi
-            xcrun simctl boot "$SIMULATOR_UDID"
-            sleep 10  # Wait for boot
+            echo "Selected fallback UDID: ${SIMULATOR_UDID}"
+            xcrun simctl boot "${SIMULATOR_UDID}"
+            sleep 20  # Increased wait for boot (Shutdown devices take longer)
+            # Verify boot status
+            BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}")
+            echo "Boot status: ${BOOT_STATUS}"
           else
-            echo "--- Booting simulator (UDID: ${SIMULATOR_UDID}) ---"
-            xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+            echo "--- Booting available simulator (UDID: ${SIMULATOR_UDID}) ---"
+            xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
+            sleep 10
           fi
 
           echo "--- Uploading malicious file (${JPEG_PATH}) to the simulator's Photos library ---"
-          xcrun simctl addmedia "$SIMULATOR_UDID" "$JPEG_PATH"
+          xcrun simctl addmedia "${SIMULATOR_UDID}" "$JPEG_PATH"
 
           echo "--- Starting system log capture... ---"
           # Start 'log stream' in the background to capture logs from the simulator
           # This predicate filters for logs from the Photos app (MobileSlideShow) or any system-level crash report
-          timeout 20s xcrun simctl spawn "$SIMULATOR_UDID" log stream --predicate 'process == "MobileSlideShow" or eventType == crash' > "$LOG_FILE" &
+          timeout 30s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'process == "MobileSlideShow" or eventType == crash' > "$LOG_FILE" &
           LOG_PID=$!
           
           sleep 5 # Give the logger a moment to initialize
 
           echo "--- Launching Photos app to trigger the file open ---"
-          xcrun simctl launch "$SIMULATOR_UDID" com.apple.mobileslideshow
+          xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
 
           echo "--- Waiting 15 seconds for potential crash to be logged ---"
           sleep 15
@@ -90,10 +97,14 @@ jobs:
           kill "$LOG_PID" 2>/dev/null || true # Cleanly stop the log stream process
 
           echo "--- Shutting down the simulator ---"
-          xcrun simctl shutdown "$SIMULATOR_UDID"
+          xcrun simctl shutdown "${SIMULATOR_UDID}"
 
           echo "--- Log capture complete. Log content: ---"
-          cat "$LOG_FILE"
+          if [ -f "$LOG_FILE" ]; then
+            cat "$LOG_FILE"
+          else
+            echo "No log file generated."
+          fi
           
           # Set paths as outputs for the artifact upload step
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
