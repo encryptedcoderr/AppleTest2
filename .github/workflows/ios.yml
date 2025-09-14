@@ -34,39 +34,36 @@ jobs:
           # Run your script to create the JPEGs in its output directory
           python MaliciousJPEGGenerator.py
           
-          # Find the specific info-leak jpeg to use it later
-          # Your script creates this file first (exploit_0.jpg)
-          INFO_LEAK_FILE=$(ls malicious_jpegs/exploit_*.jpg | head -n 1)
-          echo "jpeg_path=${INFO_LEAK_FILE}" >> "$GITHUB_OUTPUT"
+          # List all generated JPEGs for individual opening
+          JPEGS=$(ls malicious_jpegs/exploit_*.jpg | tr '\n' ' ')
+          echo "jpeg_list=${JPEGS}" >> "$GITHUB_OUTPUT"
           echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
 
       - name: 5. Fuzz Simulator and Capture Log
         id: fuzz_ios
         working-directory: ./main
         run: |
-          JPEG_PATH="${{ steps.generate_jpegs.outputs.jpeg_path }}"
-          LOG_FILE="ios_simulator_crash.log"
+          JPEG_LIST="${{ steps.generate_jpegs.outputs.jpeg_list }}"
+          LOG_FILE="ios_simulator_errors.log"  # Renamed for errors (not just crashes)
+
+          # FIXED: Install coreutils for gtimeout (macOS timeout equivalent)
+          brew install coreutils
 
           echo "--- Finding an available iPhone simulator ---"
-          # FIXED: Use optional chaining (.name?) to handle nulls safely in startswith
           SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
           
-          # Debug: Log full JSON if none found
           if [ -z "$SIMULATOR_UDID" ]; then
             echo "--- No available simulators found. Full JSON debug: ---"
             xcrun simctl list devices available -j
-            echo "--- Listing all devices for fallback selection ---"
-            xcrun simctl list devices
             echo "--- Booting first iPhone simulator as fallback ---"
-            # FIXED Fallback: Ignore availability, strict null-safe iPhone filter
             SIMULATOR_UDID=$(xcrun simctl list devices -j | jq -r '.devices | .[] | .[] | select(.name? | startswith("iPhone") // false) | .udid' | head -n 1)
             if [ -z "$SIMULATOR_UDID" ]; then
-              echo "::error::No iPhone simulators found at all. Check Xcode installation."
+              echo "::error::No iPhone simulators found at all."
               exit 1
             fi
             echo "Selected fallback UDID: ${SIMULATOR_UDID}"
             xcrun simctl boot "${SIMULATOR_UDID}"
-            # FIXED: Poll bootstatus until "Finished" (handles data migration delay)
+            # Poll boot until "Finished"
             echo "--- Monitoring boot until complete (up to 120s) ---"
             BOOT_TIMEOUT=120
             BOOT_ELAPSED=0
@@ -81,7 +78,7 @@ jobs:
               echo "--- Boot progress: $BOOT_ELAPSED s ---"
             done
             if [ $BOOT_ELAPSED -ge $BOOT_TIMEOUT ]; then
-              echo "::warning::Boot timed out after 120s; proceeding anyway."
+              echo "::warning::Boot timed out; proceeding."
             fi
           else
             echo "--- Booting available simulator (UDID: ${SIMULATOR_UDID}) ---"
@@ -89,30 +86,48 @@ jobs:
             sleep 10
           fi
 
-          echo "--- Uploading malicious file (${JPEG_PATH}) to the simulator's Photos library ---"
-          xcrun simctl addmedia "${SIMULATOR_UDID}" "$JPEG_PATH"
+          # Upload all JPEGs to Photos library
+          echo "--- Uploading all malicious JPEGs to simulator's Photos library ---"
+          for jpeg in $JPEG_LIST; do
+            xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg"
+            echo "Uploaded: $jpeg"
+          done
 
-          echo "--- Starting system log capture... ---"
-          # FIXED: Broader predicate for errors (not just crash/fault; includes Photos subsystem and general errors)
-          # Use background sleep + kill instead of timeout (macOS compatible)
-          xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'subsystem == "com.apple.photos" or process == "MobileSlideShow" or eventType == error or eventType == fault or eventType == crash' > "$LOG_FILE" &
+          echo "--- Starting system log capture (broader for errors) ---"
+          # FIXED: Use gtimeout (from coreutils) for macOS compatibility; broader predicate for errors
+          gtimeout 95s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --predicate 'subsystem == "com.apple.photos" or process == "MobileSlideShow" or eventType == error or eventType == fault or eventType == crash or message CONTAINS "JPEG" or message CONTAINS "decode"' > "$LOG_FILE" &
           LOG_PID=$!
           
-          # FIXED: Kill after 80s (20s capture + 60s delay) using sleep + kill (no timeout needed)
-          (sleep 80 && kill "$LOG_PID" 2>/dev/null || true) &
-          KILL_PID=$!
-          
-          sleep 5 # Give the logger a moment to initialize
+          sleep 5 # Logger init
 
-          echo "--- Launching Photos app to trigger the file open ---"
+          echo "--- Launching Photos app ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
 
-          echo "--- Waiting 60 seconds for reliable logging (errors/crashes) ---"
-          sleep 60  # FIXED: 60s delay for full interaction/error capture
+          # FIXED: Open each uploaded JPEG to trigger decode (simulate user interaction)
+          echo "--- Opening each uploaded JPEG to trigger potential errors ---"
+          for jpeg in $JPEG_LIST; do
+            echo "--- Opening $jpeg ---"
+            # Use AppleScript via osascript to open Photos, search, and view the JPEG (by filename or recent)
+            osascript -l JavaScript << EOF
+              var app = Application('Photos');
+              app.activate();
+              delay 2;
+              // Search for recent uploads (assumes JPEG is newest)
+              var results = app.search('recent photos');
+              if (results.length > 0) {
+                results[0].select();
+                delay 3; // Time for decode
+              }
+            EOF
+            echo "Opened/processed $jpeg (waited 3s for decode)."
+            sleep 5  # Per-JPEG delay for sequential processing
+          done
+
+          echo "--- Waiting 60 seconds for reliable logging ---"
+          sleep 60  # FIXED: 60s total delay for errors
 
           echo "--- Stopping log capture ---"
           kill "$LOG_PID" 2>/dev/null || true
-          kill "$KILL_PID" 2>/dev/null || true # Clean up kill process
 
           echo "--- Shutting down the simulator ---"
           xcrun simctl shutdown "${SIMULATOR_UDID}"
@@ -120,15 +135,14 @@ jobs:
           echo "--- Log capture complete. Log content: ---"
           if [ -f "$LOG_FILE" ]; then
             cat "$LOG_FILE"
-            # FIXED: If empty, grep system logs for JPEG/Photos errors
+            # FIXED: If empty, grep system logs for JPEG/Photos/decode errors
             if [ ! -s "$LOG_FILE" ]; then
               echo "--- No logs from stream; checking system logs for JPEG errors ---"
-              log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos" or eventMessage CONTAINS "MobileSlideShow"' --last 5m --info --debug --style syslog | head -50
+              log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos" or eventMessage CONTAINS "decode" or eventMessage CONTAINS "MobileSlideShow"' --last 10m --info --debug --style syslog | head -100
             fi
           else
             echo "No log file generated."
-            # Fallback grep
-            log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos"' --last 5m --info --debug --style syslog | head -50
+            log show --predicate 'eventMessage CONTAINS "JPEG" or eventMessage CONTAINS "Photos"' --last 10m --info --debug --style syslog | head -100
           fi
           
           # Set paths as outputs for the artifact upload step
