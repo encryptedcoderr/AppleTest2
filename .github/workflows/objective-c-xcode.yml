@@ -1,40 +1,71 @@
-name: iOS JPEG Fuzzer Workflow
+name: iOS JPEG Fuzz + Trace Analysis Workflow
 
 on:
   workflow_dispatch:
 
 jobs:
-  fuzz-and-log-ios:
-    name: Generate Malicious JPEG and Log Simulator Response
+  fuzz-and-analyze:
+    name: Fuzz Simulator, Capture Allocations, Analyze Trace
     runs-on: macos-latest
 
     steps:
+      # -----------------------------
+      # Step 1. Checkout Repository
+      # -----------------------------
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
         with:
           path: main
 
+      # -----------------------------
+      # Step 2. Python Environment
+      # -----------------------------
       - name: 2. Set up Python Environment
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 3. Install Python Dependencies
+      # -----------------------------
+      # Step 3. Install Dependencies
+      # -----------------------------
+      - name: 3. Install Python + Brew Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install Pillow
+          pip install Pillow lxml jq
+          brew install coreutils jq
 
-      - name: 4. Generate Malicious JPEGs
+      # -----------------------------
+      # Step 4. Generate Exploit JPEGs
+      # -----------------------------
+      - name: 4. Generate Exploit JPEGs
         id: generate_jpegs
         working-directory: ./main
         run: |
+          set -euo pipefail
           python MaliciousJPEGGenerator.py
-          
-          JPEGS=$(ls malicious_jpegs/exploit_*.jpg | tr '\n' ' ')
-          echo "jpeg_list=${JPEGS}" >> "$GITHUB_OUTPUT"
-          echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
 
-      - name: 5. Fuzz Simulator and Capture Log
+          echo "--- Renaming Safe_*.jpg to exploit_*.jpg ---"
+          mkdir -p malicious_jpegs
+          for file in malicious_jpegs/Safe_*.jpg; do
+            if [ -f "$file" ]; then
+              base=$(basename "$file" .jpg)
+              new_name=$(echo "$base" | sed 's/Safe_/exploit_/').jpg
+              mv "$file" "malicious_jpegs/$new_name"
+              echo "Renamed $file to malicious_jpegs/$new_name"
+            fi
+          done
+
+          JPEGS=$(ls malicious_jpegs/exploit_*.jpg 2>/dev/null | tr '\n' ' ' || echo "")
+          if [ -z "$JPEGS" ]; then
+            echo "::warning::No exploit_*.jpg files found in malicious_jpegs/"
+          fi
+          echo "jpeg_list=${JPEGS}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------
+      # Step 5. Fuzz Simulator & Capture Trace
+      # -----------------------------
+      - name: 5. Fuzz Simulator and Capture Trace
         id: fuzz_ios
         working-directory: ./main
         run: |
@@ -43,109 +74,228 @@ jobs:
           LOG_FILE="ios_simulator_errors.log"
           NDJSON_FILE="ios_simulator_ndjson.log"
           INSTR_DIR="instruments_trace"
+          JPEG_MAPPING="jpeg_mapping.txt"
 
-          brew install coreutils jq
-
-          echo "--- Finding an available iPhone simulator (iOS 18+) ---"
-          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | to_entries[] | select(.key | test("iOS-18-[0-9]"; "i")) | .value[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
-          
+          echo "--- Booting Simulator ---"
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
           if [ -z "$SIMULATOR_UDID" ]; then
-            echo "--- No iOS 18+ available; fallback to any iPhone ---"
-            SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
-            if [ -z "$SIMULATOR_UDID" ]; then
-              echo "--- No iPhone simulators found. Debug JSON: ---"
-              xcrun simctl list devices available -j
-              echo "::error::No iPhone simulators found."
-              exit 1
-            fi
-            echo "Selected fallback UDID: ${SIMULATOR_UDID}"
-            xcrun simctl boot "${SIMULATOR_UDID}"
-            BOOT_TIMEOUT=180
-            BOOT_ELAPSED=0
-            while [ $BOOT_ELAPSED -lt $BOOT_TIMEOUT ]; do
-              BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" 2>/dev/null | grep -E "(Status|Finished)")
-              if echo "$BOOT_STATUS" | grep -q "Finished"; then
-                echo "--- Boot complete! ---"
-                break
-              fi
-              if [ $BOOT_ELAPSED -ge 150 ]; then
-                echo "::warning::Simulator boot taking longer than expected (${BOOT_ELAPSED}s)"
-              fi
-              sleep 5
-              BOOT_ELAPSED=$((BOOT_ELAPSED + 5))
-            done
-          else
-            xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
-            sleep 10
+            echo "::error::No iPhone simulators found."
+            exit 1
           fi
+          xcrun simctl boot "${SIMULATOR_UDID}"
+          xcrun simctl bootstatus "${SIMULATOR_UDID}" -b
+          sleep 10
           echo "Using UDID: ${SIMULATOR_UDID}"
 
           echo "--- Uploading JPEGs ---"
+          : > "$JPEG_MAPPING"
           for jpeg in $JPEG_LIST; do
-            if xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" >> /dev/null 2>&1; then
-              echo "Uploaded: $jpeg"
+            if OUTPUT=$(xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" 2>&1); then
+              DCIM_NAME=$(echo "$OUTPUT" | grep -o 'IMG_[0-9]*\.JPG' || echo "unknown")
+              echo "$jpeg -> $DCIM_NAME" >> "$JPEG_MAPPING"
             else
-              echo "Upload skipped for $jpeg"
+              echo "$jpeg -> skipped (error: $OUTPUT)" >> "$JPEG_MAPPING"
             fi
           done
 
-          echo "--- Launching Photos app ---"
-          xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
-          sleep 15
-
-          echo "--- Starting Instruments trace for allocations (OOM detection) ---"
-          mkdir -p "${INSTR_DIR}"
-          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach com.apple.mobileslideshow || echo "::warning::Instruments trace failed, continuing with log capture"
-          INSTR_PID=$!
-
-          echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
-          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
-          gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
-          LOG_PID=$!
-          
-          sleep 5
-
-          echo "--- Triggering decode via Photos app ---"
-          NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 20 + 60))  # Increased delay per JPEG for first boot
-          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
-          sleep $PROCESS_DELAY
-
-          echo "--- Additional buffer for async faults ---"
-          sleep 60
-
-          echo "--- Stopping log/trace capture ---"
-          kill "$LOG_PID" "$INSTR_PID" 2>/dev/null || true
-          sleep 5  # Ensure trace closes
-
-          echo "--- Shutting down simulator ---"
-          xcrun simctl shutdown "${SIMULATOR_UDID}" 2>/dev/null || true
-
-          echo "--- Log capture complete. NDJSON content: ---"
-          if [ -s "$NDJSON_FILE" ]; then
-            cat "$NDJSON_FILE"
+          echo "--- Launching Photos ---"
+          APP_PID=$(xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow | awk -F': ' '{print $2}' || echo "")
+          if [ -z "$APP_PID" ]; then
+            echo "::warning::Failed to launch Photos app"
           else
-            echo "--- No stream logs; fallback search (20m) ---"
-            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" OR eventMessage CONTAINS "EXC"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
-            cat "$LOG_FILE"
+            echo "Launched Photos app with PID: $APP_PID"
+            sleep 45
           fi
-          
-          if log show --predicate 'messageType == error AND (eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV")' --last 20m --style syslog | grep -q "EXC\|SEGV"; then
-            echo "::warning::Potential crash detected in faults!"
-          fi
-          
-          echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
-          echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
-          echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
-          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
 
-      - name: 6. Upload Fuzzing Artifacts
+          echo "--- Starting Allocations Trace (immediate mode) ---"
+          mkdir -p "${INSTR_DIR}"
+          if [ -n "$APP_PID" ]; then
+            echo "--- Verifying process is running ---"
+            if xcrun simctl listapps "${SIMULATOR_UDID}" | grep -q "com.apple.mobileslideshow"; then
+              xcrun xctrace record \
+                --template "Allocations" \
+                --output "${INSTR_DIR}" \
+                --device "${SIMULATOR_UDID}" \
+                --attach "$APP_PID" \
+                --time-limit 540s \
+                --recording-mode immediate \
+                --quiet || {
+                  echo "::warning::Trace failed for PID $APP_PID, falling back to all-processes"
+                  xcrun xctrace record \
+                    --template "Allocations" \
+                    --output "${INSTR_DIR}" \
+                    --device "${SIMULATOR_UDID}" \
+                    --all-processes \
+                    --time-limit 540s \
+                    --recording-mode immediate \
+                    --quiet || echo "::warning::Fallback trace failed"
+                }
+            else
+              echo "::warning::Photos app (PID $APP_PID) not running, falling back to all-processes"
+              xcrun xctrace record \
+                --template "Allocations" \
+                --output "${INSTR_DIR}" \
+                --device "${SIMULATOR_UDID}" \
+                --all-processes \
+                --time-limit 540s \
+                --recording-mode immediate \
+                --quiet || echo "::warning::Fallback trace failed"
+            fi
+          else
+            echo "::warning::No PID for Photos app, using all-processes trace"
+            xcrun xctrace record \
+              --template "Allocations" \
+              --output "${INSTR_DIR}" \
+              --device "${SIMULATOR_UDID}" \
+              --all-processes \
+              --time-limit 540s \
+              --recording-mode immediate \
+              --quiet || echo "::warning::Fallback trace failed"
+          fi
+
+          echo "--- Capturing Logs ---"
+          gtimeout 120 xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson > "$NDJSON_FILE" 2>/dev/null || true
+          if [ -s "$NDJSON_FILE" ]; then
+            echo "Captured logs to $NDJSON_FILE"
+          else
+            echo "::warning::No logs captured in $NDJSON_FILE"
+          fi
+
+          echo "--- Shutting down Simulator ---"
+          xcrun simctl shutdown "${SIMULATOR_UDID}" || true
+
+          echo "log_file=${LOG_FILE}" >> "$GITHUB_OUTPUT"
+          echo "ndjson_file=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
+          echo "trace_folder=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_mapping=${JPEG_MAPPING}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------
+      # Step 6. Unzip and Analyze Instruments Trace
+      # -----------------------------
+      - name: 6. Unzip and Analyze Instruments Trace
+        id: analyze_trace
+        working-directory: ./main
+        run: |
+          set -euo pipefail
+          TRACE_ZIP="Apple.zip"
+          LOG_FILE="${{ steps.fuzz_ios.outputs.log_file }}"
+          NDJSON_FILE="${{ steps.fuzz_ios.outputs.ndjson_file }}"
+          JPEG_MAPPING="${{ steps.fuzz_ios.outputs.jpeg_mapping }}"
+          OUTPUT_DIR="trace_analysis"
+          TRACE_REPORT="${OUTPUT_DIR}/trace_report.json"
+          SUMMARY_FILE="${OUTPUT_DIR}/analysis_summary.txt"
+
+          mkdir -p "${OUTPUT_DIR}"
+          : > "${SUMMARY_FILE}"
+          echo "Trace Analysis Summary" >> "${SUMMARY_FILE}"
+          echo "=====================" >> "${SUMMARY_FILE}"
+          echo "Timestamp: $(date -u)" >> "${SUMMARY_FILE}"
+          echo "" >> "${SUMMARY_FILE}"
+
+          echo "--- Listing repository files for debugging ---"
+          find . -type f -ls
+          find . -type d -name "*.trace"
+
+          echo "--- Checking for Apple.zip ---"
+          if [ -f "${TRACE_ZIP}" ]; then
+            echo "Found trace zip: ${TRACE_ZIP}"
+            echo "--- Checking zip validity ---"
+            if unzip -t "${TRACE_ZIP}" > unzip_test.log 2>&1; then
+              echo "--- Unzipping trace to current directory ---"
+              unzip -q "${TRACE_ZIP}" -d . || {
+                echo "::warning::Failed to unzip ${TRACE_ZIP}. See unzip_test.log for details."
+                cat unzip_test.log
+              }
+              TRACE_FOLDER=$(find . -type d -name "*.trace" | head -n 1)
+              if [ -n "${TRACE_FOLDER}" ]; then
+                echo "Extracted trace folder: ${TRACE_FOLDER}"
+              else
+                echo "::warning::No .trace folder found after unzipping ${TRACE_ZIP}"
+              fi
+            else
+              echo "::warning::Invalid or corrupted zip file: ${TRACE_ZIP}"
+              cat unzip_test.log
+            fi
+          else
+            echo "::warning::No Apple.zip file found in repository"
+            TRACE_FOLDER=$(find . -type d -name "*.trace" | head -n 1)
+            if [ -n "${TRACE_FOLDER}" ]; then
+              echo "Found trace folder (no zip): ${TRACE_FOLDER}"
+            else
+              echo "::warning::No .trace folder found in repository"
+            fi
+          fi
+
+          echo "--- Analyzing trace ---"
+          if [ -n "${TRACE_FOLDER}" ] && [ -d "${TRACE_FOLDER}" ]; then
+            echo "Processing trace: ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
+            echo "Processing trace: ${TRACE_FOLDER}"
+
+            echo "--- Exporting trace data to JSON ---"
+            if xcrun xctrace export --input "${TRACE_FOLDER}" --output "${TRACE_REPORT}" --output-type json; then
+              echo "--- Analyzing trace for memory spikes and OOM ---"
+              MAX_MEMORY=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .statistics | select(.name == "Live Bytes") | .max // 0' "${TRACE_REPORT}" | sort -nr | head -n 1)
+              echo "Max Live Bytes: ${MAX_MEMORY} bytes" >> "${SUMMARY_FILE}"
+              if [ "${MAX_MEMORY}" -gt 1000000000 ]; then
+                echo "::warning::Potential OOM detected: Max Live Bytes exceeds 1GB (${MAX_MEMORY} bytes)"
+                echo "Potential OOM: Max Live Bytes = ${MAX_MEMORY} bytes (>1GB)" >> "${SUMMARY_FILE}"
+              fi
+
+              MOBILE_SLIDESHOW_ALLOCS=$(jq -r '.trace.tracks[] | select(.name == "Allocations") | .data[] | .allocations[] | select(.process == "MobileSlideShow") | "\(.size) bytes at \(.timestamp)"' "${TRACE_REPORT}" | sort -nr | head -n 10)
+              echo "Top 10 MobileSlideShow Allocations (bytes, timestamp):" >> "${SUMMARY_FILE}"
+              echo "${MOBILE_SLIDESHOW_ALLOCS}" >> "${SUMMARY_FILE}"
+            else
+              echo "::warning::Failed to export trace to JSON"
+              echo "Trace Export Failed: Could not process ${TRACE_FOLDER}" >> "${SUMMARY_FILE}"
+            fi
+          else
+            echo "::warning::No .trace folder available for analysis"
+            echo "No trace folder available for analysis" >> "${SUMMARY_FILE}"
+          fi
+
+          echo "" >> "${SUMMARY_FILE}"
+
+          echo "--- Correlating with logs and JPEG mapping ---"
+          if [ -n "${NDJSON_FILE}" ] && [ -f "${NDJSON_FILE}" ]; then
+            echo "Log Errors (from ios_simulator_ndjson.log):" >> "${SUMMARY_FILE}"
+            jq -r '. | select(.eventMessage | test("error|EXC|SEGV|Too large image|ImageIO|Tungsten")) | "\(.timestamp) \(.eventMessage)"' "${NDJSON_FILE}" | head -n 20 >> "${SUMMARY_FILE}"
+          elif [ -n "${LOG_FILE}" ] && [ -f "${LOG_FILE}" ]; then
+            echo "Log Errors (from ios_simulator_errors.log):" >> "${SUMMARY_FILE}"
+            grep -E "error|EXC|SEGV|Too large image|ImageIO|Tungsten" "${LOG_FILE}" | head -n 20 >> "${SUMMARY_FILE}"
+          else
+            echo "No logs found for correlation" >> "${SUMMARY_FILE}"
+          fi
+
+          echo "" >> "${SUMMARY_FILE}"
+
+          if [ -n "${JPEG_MAPPING}" ] && [ -f "${JPEG_MAPPING}" ]; then
+            echo "JPEG to DCIM Mapping:" >> "${SUMMARY_FILE}"
+            cat "${JPEG_MAPPING}" >> "${SUMMARY_FILE}"
+          else
+            echo "No JPEG mapping file found" >> "${SUMMARY_FILE}"
+          fi
+
+          echo "--- Analysis complete. Summary: ---"
+          cat "${SUMMARY_FILE}"
+
+          echo "trace_report=${TRACE_REPORT}" >> "$GITHUB_OUTPUT"
+          echo "summary_file=${SUMMARY_FILE}" >> "$GITHUB_OUTPUT"
+          echo "output_dir=${OUTPUT_DIR}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------
+      # Step 7. Upload Artifacts
+      # -----------------------------
+      - name: 7. Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-fuzzing-results-${{ github.run_id }}
+          name: fuzz-trace-analysis-${{ github.run_id }}
           path: |
-            main/${{ steps.fuzz_ios.outputs.jpeg_dir }}
-            main/${{ steps.fuzz_ios.outputs.log_path }}
-            main/${{ steps.fuzz_ios.outputs.ndjson_path }}
-            main/${{ steps.fuzz_ios.outputs.instr_path }}
+            main/${{ steps.generate_jpegs.outputs.jpeg_dir }}
+            main/${{ steps.fuzz_ios.outputs.log_file }}
+            main/${{ steps.fuzz_ios.outputs.ndjson_file }}
+            main/${{ steps.fuzz_ios.outputs.trace_folder }}
+            main/${{ steps.analyze_trace.outputs.output_dir }}
+            main/Apple.zip
+            main/*.trace
+            main/unzip_test.log
