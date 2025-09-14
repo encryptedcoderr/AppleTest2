@@ -42,12 +42,11 @@ jobs:
           JPEG_LIST="${{ steps.generate_jpegs.outputs.jpeg_list }}"
           LOG_FILE="ios_simulator_errors.log"
           NDJSON_FILE="ios_simulator_ndjson.log"
-          INSTR_TRACE="allocations.trace"
+          INSTR_DIR="instruments_trace"
 
           brew install coreutils jq
 
           echo "--- Finding an available iPhone simulator (iOS 18+) ---"
-          # FIXED: Check runtime in parent keys, handle null/missing runtime
           SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | to_entries[] | select(.key | test("iOS-18-[0-9]"; "i")) | .value[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
           
           if [ -z "$SIMULATOR_UDID" ]; then
@@ -64,7 +63,7 @@ jobs:
             BOOT_TIMEOUT=180
             BOOT_ELAPSED=0
             while [ $BOOT_ELAPSED -lt $BOOT_TIMEOUT ]; do
-              BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" | grep -E "(Status|Finished)")
+              BOOT_STATUS=$(xcrun simctl bootstatus "${SIMULATOR_UDID}" 2>/dev/null | grep -E "(Status|Finished)")
               if echo "$BOOT_STATUS" | grep -q "Finished"; then
                 echo "--- Boot complete! ---"
                 break
@@ -78,42 +77,35 @@ jobs:
           fi
           echo "Using UDID: ${SIMULATOR_UDID}"
 
-          echo "--- Uploading JPEGs and noting DCIM paths ---"
-          DCIM_PATHS=""
+          echo "--- Uploading JPEGs ---"
           for jpeg in $JPEG_LIST; do
             if xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" >> /dev/null 2>&1; then
               echo "Uploaded: $jpeg"
-              DCIM_PATH="/var/mobile/Media/DCIM/100APPLE/$(basename $jpeg)"
-              DCIM_PATHS="${DCIM_PATHS} $DCIM_PATH"
             else
               echo "Upload skipped for $jpeg"
             fi
           done
-          echo "DCIM paths: $DCIM_PATHS"
 
           echo "--- Starting Instruments trace for allocations (OOM detection) ---"
-          xcrun xctrace run "${SIMULATOR_UDID}" --template "Allocations" --output "${INSTR_TRACE}" --launchApp com.apple.mobileslideshow &
+          mkdir -p "${INSTR_DIR}"
+          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" &
           INSTR_PID=$!
 
-          echo "--- Starting system log capture (enhanced for ImageIO faults/crashes) ---"
-          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
-          gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --info --debug --fault --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" &
+          echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
+          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
+          gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
           LOG_PID=$!
           
           sleep 5
 
           echo "--- Launching Photos app ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
-          sleep 10
+          sleep 15
 
-          echo "--- Triggering decode: Recents URL + fallback direct open ---"
+          echo "--- Triggering decode via Photos app ---"
           NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          PROCESS_DELAY=$((NUM_JPEGS * 10 + 60))
-          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL fallback to app load"
-          for dcim in $DCIM_PATHS; do
-            xcrun simctl spawn "${SIMULATOR_UDID}" open "$dcim" || echo "Direct open skipped for $dcim"
-            sleep 10
-          done
+          PROCESS_DELAY=$((NUM_JPEGS * 15 + 60))  # Increased delay per JPEG
+          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL open failed, relying on Photos app load"
           sleep $PROCESS_DELAY
 
           echo "--- Additional buffer for async faults ---"
@@ -121,26 +113,28 @@ jobs:
 
           echo "--- Stopping log/trace capture ---"
           kill "$LOG_PID" "$INSTR_PID" 2>/dev/null || true
+          sleep 5  # Ensure trace closes
 
           echo "--- Shutting down simulator ---"
-          xcrun simctl shutdown "${SIMULATOR_UDID}"
+          xcrun simctl shutdown "${SIMULATOR_UDID}" 2>/dev/null || true
 
           echo "--- Log capture complete. NDJSON content: ---"
-          cat "$NDJSON_FILE"
-          if [ ! -s "$NDJSON_FILE" ]; then
+          if [ -s "$NDJSON_FILE" ]; then
+            cat "$NDJSON_FILE"
+          else
             echo "--- No stream logs; fallback search (20m) ---"
-            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "Tungsten" OR eventMessage CONTAINS "EXC"' --last 20m --info --debug --fault --style syslog | head -200
+            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" OR eventMessage CONTAINS "EXC"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
+            cat "$LOG_FILE"
           fi
           
-          if log show --predicate 'messageType == fault' --last 20m | grep -q "fault"; then
+          if log show --predicate 'messageType == error AND (eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV")' --last 20m --style syslog | grep -q "EXC\|SEGV"; then
             echo "::warning::Potential crash detected in faults!"
           fi
           
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
           echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
-          echo "instr_path=${INSTR_TRACE}" >> "$GITHUB_OUTPUT"
+          echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
           echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
-          echo "dcim_paths=${DCIM_PATHS}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
         if: always()
