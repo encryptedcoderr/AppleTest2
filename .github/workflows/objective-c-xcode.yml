@@ -1,19 +1,22 @@
-name: Fuzz Image Parser and Capture Log
+name: iOS JPEG Fuzzer Workflow
 
 on:
   # This allows you to run the workflow manually from the Actions tab in GitHub
   workflow_dispatch:
 
 jobs:
-  fuzz-and-log:
-    name: Generate Malicious JPEG and Log System Response
+  fuzz-and-log-ios:
+    name: Generate Malicious JPEG and Log Simulator Response
     
-    # This must run on a self-hosted macOS runner to interact with the GUI and system logs.
-    runs-on: self-hosted
+    # --- THIS IS THE FIX ---
+    # Use a standard, GitHub-provided macOS runner instead of a self-hosted one.
+    runs-on: macos-latest
 
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
+        with:
+          path: main
 
       - name: 2. Set up Python Environment
         uses: actions/setup-python@v5
@@ -21,57 +24,68 @@ jobs:
           python-version: '3.11'
 
       - name: 3. Install Python Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install Pillow
+        run: pip install Pillow
 
       - name: 4. Generate Malicious JPEGs
-        id: generate_jpeg
+        id: generate_jpegs
+        working-directory: ./main
         run: |
-          # Run your script to create the JPEGs in its output directory
           python MaliciousJPEGGenerator.py
-          
-          # Set the path to the specific info-leak JPEG as an output for the next step
-          # Based on your script, the info-leak file is the first one generated (exploit_0.jpg)
-          echo "jpeg_path=malicious_jpegs/exploit_0.jpg" >> "$GITHUB_OUTPUT"
+          INFO_LEAK_FILE=$(ls malicious_jpegs/exploit_*.jpg | head -n 1)
+          echo "jpeg_path=${INFO_LEAK_FILE}" >> "$GITHUB_OUTPUT"
           echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
 
-      - name: 5. Capture System Log While Opening JPEG
-        id: capture_log
+      - name: 5. Fuzz Simulator and Capture Log
+        id: fuzz_ios
+        working-directory: ./main
         run: |
-          JPEG_PATH="${{ steps.generate_jpeg.outputs.jpeg_path }}"
-          LOG_FILE="system_crash_report.log"
+          set -e
+          JPEG_PATH="${{ steps.generate_jpegs.outputs.jpeg_path }}"
+          LOG_FILE="ios_simulator_crash.log"
+
+          echo "--- Finding an available iPhone simulator ---"
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and .name | startswith("iPhone")) | .udid' | head -n 1)
+          
+          if [ -z "$SIMULATOR_UDID" ]; then
+            echo "::error::No available iPhone simulators found."
+            exit 1
+          fi
+          
+          echo "--- Booting simulator (UDID: ${SIMULATOR_UDID}) ---"
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
+          echo "--- Uploading malicious file (${JPEG_PATH}) to the simulator's Photos library ---"
+          xcrun simctl addmedia "$SIMULATOR_UDID" "$JPEG_PATH"
 
           echo "--- Starting system log capture... ---"
-          # Start the 'log stream' command in the background.
-          # The predicate is crucial: it filters for logs from the Preview process
-          # and any general crash reports from the system's launch daemon.
-          # The command will run for a maximum of 20 seconds.
-          timeout 20s log stream --predicate 'process == "Preview" or (subsystem == "com.apple.launchd" and composedMessage CONTAINS[c] "crashed")' > "$LOG_FILE" &
+          timeout 20s xcrun simctl spawn "$SIMULATOR_UDID" log stream --predicate 'process == "MobileSlideShow" or eventType == crash' > "$LOG_FILE" &
           LOG_PID=$!
-
-          echo "--- Opening malicious JPEG with Preview.app to trigger a crash ---"
-          # The 'open' command attempts to launch the JPEG in Preview.
-          # We add a 'timeout' in case the application hangs instead of crashing.
-          # The '|| true' ensures the workflow doesn't fail if the timeout is hit.
-          timeout 10s open -a /System/Applications/Preview.app "$JPEG_PATH" || echo "Preview process finished or was timed out."
-
-          # Wait a few seconds to ensure any final crash logs are written.
+          
           sleep 5
-          kill "$LOG_PID" 2>/dev/null || true # Cleanly stop the log stream process
+
+          echo "--- Launching Photos app to trigger the file open ---"
+          xcrun simctl launch "$SIMULATOR_UDID" com.apple.mobileslideshow
+
+          echo "--- Waiting 15 seconds for potential crash to be logged ---"
+          sleep 15
+
+          echo "--- Stopping log capture ---"
+          kill "$LOG_PID" 2>/dev/null || true
+
+          echo "--- Shutting down the simulator ---"
+          xcrun simctl shutdown "$SIMULATOR_UDID"
 
           echo "--- Log capture complete. Log content: ---"
           cat "$LOG_FILE"
           
-          # Set paths as outputs for the artifact upload step
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
-          echo "jpeg_dir=${{ steps.generate_jpeg.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
-        if: always() # This ensures artifacts are uploaded even if a previous step fails
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzzing-results-${{ github.run_id }}
+          name: ios-fuzzing-results-${{ github.run_id }}
           path: |
-            ${{ steps.capture_log.outputs.jpeg_dir }}
-            ${{ steps.capture_log.outputs.log_path }}
+            main/${{ steps.fuzz_ios.outputs.jpeg_dir }}
+            main/${{ steps.fuzz_ios.outputs.log_path }}
