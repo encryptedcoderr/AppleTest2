@@ -43,11 +43,12 @@ jobs:
         id: fuzz_ios
         working-directory: ./main
         run: |
+          set -euo pipefail  # FIXED: Strict error handling
           JPEG_LIST="${{ steps.generate_jpegs.outputs.jpeg_list }}"
           LOG_FILE="ios_simulator_errors.log"  # Renamed for errors (not just crashes)
 
-          # FIXED: Install coreutils for gtimeout (macOS timeout equivalent)
-          brew install coreutils
+          # FIXED: Install coreutils and jq for gtimeout and JSON parsing
+          brew install coreutils jq
 
           echo "--- Finding an available iPhone simulator ---"
           SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and (.name? | startswith("iPhone") // false)) | .udid' | head -n 1)
@@ -94,45 +95,26 @@ jobs:
           done
 
           echo "--- Starting system log capture (broader for errors) ---"
-          # FIXED: Use valid predicate (no 'eventType == crash'; use faultEvent/error/fault instead); added --debug for verbosity
-          PREDICATE='subsystem == "com.apple.photos" OR process == "MobileSlideShow" OR eventType == faultEvent OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode"'
-          gtimeout 95s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --debug --predicate "$PREDICATE" > "$LOG_FILE" &
+          # FIXED: Valid predicate (removed invalid eventType == faultEvent; kept messageType for faults/errors); added --info --debug
+          PREDICATE='subsystem == "com.apple.photos" OR process == "MobileSlideShow" OR messageType == fault OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode"'
+          gtimeout 120s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --info --debug --predicate "$PREDICATE" > "$LOG_FILE" &
           LOG_PID=$!
           
           sleep 5 # Logger init
 
           echo "--- Launching Photos app ---"
           xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow
+          sleep 10  # Let app load
 
-          # FIXED: Open each uploaded JPEG to trigger decode (simulate user interaction); improved AppleScript for reliability
-          echo "--- Opening each uploaded JPEG to trigger potential errors ---"
+          # FIXED: Replace AppleScript loop with URL scheme to Recents (triggers decode in simulator Photos app; no heredoc issues)
+          echo "--- Opening Recents in Photos app to trigger decode for all JPEGs ---"
           NUM_JPEGS=$(echo $JPEG_LIST | wc -w)
-          TOTAL_DELAY=$((NUM_JPEGS * 8))  # ~8s per JPEG for safety
-          for jpeg in $JPEG_LIST; do
-            echo "--- Opening $jpeg ---"
-            # Use AppleScript via osascript to open Photos, go to Recents album, and select/view first image (triggers decode)
-            osascript -l JavaScript << 'EOF'
-            var Photos = Application('Photos');
-            Photos.activate();
-            delay 2;
-            // Navigate to Recents Smart Album (uploads go here)
-            var recents = Photos.smartAlbums.whose({name: { _equal: 'Recents' }});
-            if (recents.length > 0) {
-                recents[0].selectedMediaItems[0].select();  // Select first (newest) item
-                delay 4;  // Extra time for decode/render
-            } else {
-                console.log("No Recents album found.");
-            }
+          PROCESS_DELAY=$((NUM_JPEGS * 5 + 30))  # 5s per JPEG + buffer
+          xcrun simctl openurl "${SIMULATOR_UDID}" "photos-redirect://" || echo "URL scheme failed; relying on app launch + delay"
+          sleep $PROCESS_DELAY  # Time for batch decode in Recents
 
-            if [ $? -ne 0 ]; then
-              echo "AppleScript failed for $jpeg; continuing anyway."
-            fi
-            echo "Opened/processed $jpeg (waited 4s for decode)."
-            sleep 4  # Per-JPEG delay for sequential processing
-          done
-
-          echo "--- Waiting additional time for reliable logging (total ~${TOTAL_DELAY}s activity + 60s buffer) ---"
-          sleep 60  # FIXED: 60s total delay for errors
+          echo "--- Waiting additional time for reliable logging ---"
+          sleep 60  # Buffer for errors
 
           echo "--- Stopping log capture ---"
           kill "$LOG_PID" 2>/dev/null || true
@@ -143,7 +125,7 @@ jobs:
           echo "--- Log capture complete. Log content: ---"
           if [ -f "$LOG_FILE" ]; then
             cat "$LOG_FILE"
-            # FIXED: If empty, grep system logs for JPEG/Photos/decode errors (extended to 15m)
+            # FIXED: If empty, check system logs with valid predicate (15m window)
             if [ ! -s "$LOG_FILE" ]; then
               echo "--- No logs from stream; checking system logs for JPEG errors ---"
               log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == fault OR messageType == error' --last 15m --info --debug --style syslog | head -100
