@@ -1,44 +1,99 @@
-name: iOS starter workflow
+name: iOS JPEG Fuzzer Workflow
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build and Test default scheme using any available iPhone simulator
+  fuzz-and-log-ios:
+    name: Fuzz iOS Simulator and Capture Crash Log
+    # This must run on a macOS runner to get access to Xcode and the iOS Simulator
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
+      - name: 1. Checkout Repository
         uses: actions/checkout@v4
-      - name: Set Default Scheme
+
+      - name: 2. Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. Install Python Dependencies
+        run: pip install Pillow
+
+      - name: 4. Generate Malicious JPEGs
+        id: generate_jpegs
         run: |
-          scheme_list=$(xcodebuild -list -json | tr -d "\n")
-          default=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo $default | cat >default
-          echo Using default scheme: $default
-      - name: Build
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
+          # Run your script to create the JPEGs in its output directory
+          python MaliciousJPEGGenerator.py
+          
+          # Set the path to the specific info-leak JPEG as an output for the next step.
+          # Based on your script, the info-leak file is the first one generated.
+          # We'll assume its name is consistently exploit_0.jpg or similar.
+          # Let's find the info leak file specifically by its function name in your script.
+          INFO_LEAK_FILE=$(ls malicious_jpegs/exploit_*.jpg | head -n 1) # Find the first exploit file
+          echo "jpeg_path=${INFO_LEAK_FILE}" >> "$GITHUB_OUTPUT"
+          echo "output_dir=malicious_jpegs" >> "$GITHUB_OUTPUT"
+
+      - name: 5. Fuzz iPhone Simulator and Capture Log
+        id: fuzz_ios
         run: |
-          # xcrun xctrace returns via stderr, not the expected stdout (see https://developer.apple.com/forums/thread/663959)
-          device=`xcrun xctrace list devices 2>&1 | grep -oE 'iPhone.*?[^\(]+' | head -1 | awk '{$1=$1;print}' | sed -e "s/ Simulator$//"`
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild build-for-testing -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
-      - name: Test
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
-        run: |
-          # xcrun xctrace returns via stderr, not the expected stdout (see https://developer.apple.com/forums/thread/663959)
-          device=`xcrun xctrace list devices 2>&1 | grep -oE 'iPhone.*?[^\(]+' | head -1 | awk '{$1=$1;print}' | sed -e "s/ Simulator$//"`
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild test-without-building -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
+          set -e # Exit if any command fails
+          JPEG_PATH="${{ steps.generate_jpegs.outputs.jpeg_path }}"
+          LOG_FILE="ios_simulator_crash.log"
+
+          echo "--- Finding an available iPhone simulator ---"
+          # Find the UDID of the first available iPhone simulator
+          SIMULATOR_UDID=$(xcrun simctl list devices available -j | jq -r '.devices | .[] | .[] | select(.isAvailable == true and .name | startswith("iPhone")) | .udid' | head -n 1)
+          
+          if [ -z "$SIMULATOR_UDID" ]; then
+            echo "::error::No available iPhone simulators found."
+            exit 1
+          fi
+          
+          echo "--- Booting simulator with UDID: ${SIMULATOR_UDID} ---"
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
+          echo "--- Uploading malicious file (${JPEG_PATH}) to the simulator's Photos library ---"
+          xcrun simctl addmedia "$SIMULATOR_UDID" "$JPEG_PATH"
+
+          echo "--- Starting system log capture... ---"
+          # Start 'log stream' in the background to capture logs from the simulator
+          # We are looking for crashes from MobileSlideShow (Photos app) or any crash report
+          xcrun simctl spawn "$SIMULATOR_UDID" log stream --predicate 'process == "MobileSlideShow" or eventType == crash' > "$LOG_FILE" &
+          LOG_PID=$!
+          
+          # Give the logger a moment to start up
+          sleep 5
+
+          echo "--- Launching Photos app to open the malicious JPEG ---"
+          # The Photos app will automatically open to the most recently added image
+          xcrun simctl launch "$SIMULATOR_UDID" com.apple.mobileslideshow
+
+          echo "--- Waiting for 15 seconds to allow the crash to occur and be logged ---"
+          sleep 15
+
+          echo "--- Stopping log capture ---"
+          kill "$LOG_PID" 2>/dev/null || true # Cleanly stop the log stream process
+
+          echo "--- Shutting down the simulator ---"
+          xcrun simctl shutdown "$SIMULATOR_UDID"
+
+          echo "--- Log capture complete. Log content: ---"
+          cat "$LOG_FILE"
+          
+          # Set paths as outputs for the artifact upload step
+          echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+
+      - name: 6. Upload Fuzzing Artifacts
+        # This step runs even if the fuzzing step fails (e.g., due to a crash),
+        # ensuring you always get the logs.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-fuzzing-results-${{ github.run_id }}
+          path: |
+            ${{ steps.fuzz_ios.outputs.jpeg_dir }}
+            ${{ steps.fuzz_ios.outputs.log_path }}
