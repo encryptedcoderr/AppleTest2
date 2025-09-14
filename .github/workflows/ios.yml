@@ -109,9 +109,18 @@ jobs:
             sleep 10
           done
           if [ $LAUNCH_SUCCESS -eq 0 ]; then
-            echo "::warning::Failed to launch Photos app after $LAUNCH_ATTEMPTS attempts, proceeding with decode trigger"
+            echo "::error::Failed to launch Photos app after $LAUNCH_ATTEMPTS attempts"
+            exit 1
           fi
-          sleep 30  # Increased delay for first boot
+          sleep 45  # Increased delay for first boot
+
+          echo "--- Verifying Photos app process ---"
+          PROCESS_CHECK=$(xcrun simctl spawn "${SIMULATOR_UDID}" ps -e | grep MobileSlideShow || true)
+          if echo "$PROCESS_CHECK" | grep -q "MobileSlideShow"; then
+            echo "Photos app process confirmed running"
+          else
+            echo "::warning::Photos app process not found, attempting Instruments anyway"
+          fi
 
           echo "--- Starting Instruments trace for allocations (OOM detection) ---"
           mkdir -p "${INSTR_DIR}"
@@ -122,7 +131,7 @@ jobs:
           sleep 5  # Wait for trace to initialize
 
           echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
-          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten"'
+          PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network"'
           gtimeout 180s xcrun simctl spawn "${SIMULATOR_UDID}" log stream --level debug --style ndjson --predicate "$PREDICATE" > "$NDJSON_FILE" 2>/dev/null &
           LOG_PID=$!
           
@@ -149,12 +158,12 @@ jobs:
             cat "$NDJSON_FILE"
           else
             echo "--- No stream logs; fallback search (20m) ---"
-            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" OR eventMessage CONTAINS "EXC"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
+            log show --predicate 'eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "Photos" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network"' --last 20m --info --debug --style syslog | head -200 > "$LOG_FILE"
             cat "$LOG_FILE"
           fi
           
-          if log show --predicate 'messageType == error AND (eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV")' --last 20m --style syslog | grep -q "EXC\|SEGV"; then
-            echo "::warning::Potential crash detected in faults!"
+          if log show --predicate 'messageType == error AND (eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Too large image")' --last 20m --style syslog | grep -q "EXC\|SEGV\|Too large image"; then
+            echo "::warning::Potential crash or OOM detected in faults!"
           fi
           
           if [ -d "${INSTR_DIR}" ] && [ -n "$(ls -A ${INSTR_DIR}/*.trace 2>/dev/null)" ]; then
@@ -166,7 +175,7 @@ jobs:
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
           echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
           echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
-          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=${{ steps.fuzz_ios.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
         if: always()
