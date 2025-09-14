@@ -101,7 +101,13 @@ jobs:
             echo "Launch attempt $attempt of $LAUNCH_ATTEMPTS"
             LAUNCH_OUTPUT=$(xcrun simctl launch "${SIMULATOR_UDID}" com.apple.mobileslideshow 2>&1 || true)
             if echo "$LAUNCH_OUTPUT" | grep -q "com.apple.mobileslideshow:"; then
-              echo "Photos app launched: $LAUNCH_OUTPUT"
+              APP_PID=$(echo "$LAUNCH_OUTPUT" | awk -F': ' '{print $2}')
+              echo "Photos app launched: PID=$APP_PID"
+              LAUNCH_SUCCESS=1
+              break
+            elif echo "$LAUNCH_OUTPUT" | grep -q '^[0-9]+$'; then
+              APP_PID="$LAUNCH_OUTPUT"
+              echo "Photos app launched: PID=$APP_PID"
               LAUNCH_SUCCESS=1
               break
             fi
@@ -124,8 +130,12 @@ jobs:
 
           echo "--- Starting Instruments trace for allocations (OOM detection) ---"
           mkdir -p "${INSTR_DIR}"
-          xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach com.apple.mobileslideshow || echo "::warning::Instruments trace failed, trying all-processes fallback"
-          if [ $? -ne 0 ]; then
+          if [ -n "$APP_PID" ]; then
+            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach "$APP_PID" || echo "::warning::Instruments trace failed for PID $APP_PID, trying all-processes fallback"
+          else
+            echo "::warning::No PID captured, using all-processes fallback"
+          fi
+          if [ $? -ne 0 ] || [ -z "$APP_PID" ]; then
             xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
           fi
           sleep 5  # Wait for trace to initialize
@@ -175,7 +185,7 @@ jobs:
           echo "log_path=${LOG_FILE}" >> "$GITHUB_OUTPUT"
           echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
           echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
-          echo "jpeg_dir=${{ steps.fuzz_ios.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
         if: always()
