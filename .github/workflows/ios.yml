@@ -43,6 +43,7 @@ jobs:
           LOG_FILE="ios_simulator_errors.log"
           NDJSON_FILE="ios_simulator_ndjson.log"
           INSTR_DIR="instruments_trace"
+          JPEG_MAPPING="jpeg_mapping.txt"
 
           brew install coreutils jq
 
@@ -85,12 +86,15 @@ jobs:
           fi
           echo "Using UDID: ${SIMULATOR_UDID}"
 
-          echo "--- Uploading JPEGs ---"
+          echo "--- Uploading JPEGs and mapping to DCIM ---"
+          : > "$JPEG_MAPPING"
           for jpeg in $JPEG_LIST; do
-            if xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" >> /dev/null 2>&1; then
+            if OUTPUT=$(xcrun simctl addmedia "${SIMULATOR_UDID}" "$jpeg" 2>&1); then
               echo "Uploaded: $jpeg"
+              echo "$jpeg -> $(echo "$OUTPUT" | grep -o 'IMG_[0-9]*\.JPG' || echo "unknown")" >> "$JPEG_MAPPING"
             else
               echo "Upload skipped for $jpeg"
+              echo "$jpeg -> skipped" >> "$JPEG_MAPPING"
             fi
           done
 
@@ -120,25 +124,18 @@ jobs:
           fi
           sleep 45  # Increased delay for first boot
 
-          echo "--- Verifying Photos app process ---"
-          PROCESS_CHECK=$(xcrun simctl spawn "${SIMULATOR_UDID}" ps -e | grep MobileSlideShow || true)
-          if echo "$PROCESS_CHECK" | grep -q "MobileSlideShow"; then
-            echo "Photos app process confirmed running"
-          else
-            echo "::warning::Photos app process not found, attempting Instruments anyway"
-          fi
-
           echo "--- Starting Instruments trace for allocations (OOM detection) ---"
           mkdir -p "${INSTR_DIR}"
           if [ -n "$APP_PID" ]; then
-            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach "$APP_PID" || echo "::warning::Instruments trace failed for PID $APP_PID, trying all-processes fallback"
+            if ! xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --attach "$APP_PID" --time-limit 120s --quiet; then
+              echo "::warning::Instruments trace failed for PID $APP_PID, trying all-processes fallback"
+              xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 120s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
+            fi
           else
             echo "::warning::No PID captured, using all-processes fallback"
+            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes --time-limit 120s --quiet || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
           fi
-          if [ $? -ne 0 ] || [ -z "$APP_PID" ]; then
-            xcrun xctrace record --template "Allocations" --output "${INSTR_DIR}" --device "${SIMULATOR_UDID}" --all-processes || echo "::warning::Instruments all-processes trace failed, continuing with log capture"
-          fi
-          sleep 5  # Wait for trace to initialize
+          sleep 5  # Wait for trace to finalize
 
           echo "--- Starting system log capture (enhanced for ImageIO errors/crashes) ---"
           PREDICATE='subsystem == "com.apple.photos" OR subsystem == "com.apple.imageio" OR process == "MobileSlideShow" OR messageType == error OR eventMessage CONTAINS "JPEG" OR eventMessage CONTAINS "decode" OR eventMessage CONTAINS "ImageIO" OR eventMessage CONTAINS "EXC" OR eventMessage CONTAINS "SEGV" OR eventMessage CONTAINS "Tungsten" AND NOT subsystem == "com.apple.network"'
@@ -186,6 +183,7 @@ jobs:
           echo "ndjson_path=${NDJSON_FILE}" >> "$GITHUB_OUTPUT"
           echo "instr_path=${INSTR_DIR}" >> "$GITHUB_OUTPUT"
           echo "jpeg_dir=${{ steps.generate_jpegs.outputs.output_dir }}" >> "$GITHUB_OUTPUT"
+          echo "jpeg_mapping=${JPEG_MAPPING}" >> "$GITHUB_OUTPUT"
 
       - name: 6. Upload Fuzzing Artifacts
         if: always()
@@ -197,3 +195,4 @@ jobs:
             main/${{ steps.fuzz_ios.outputs.log_path }}
             main/${{ steps.fuzz_ios.outputs.ndjson_path }}
             main/${{ steps.fuzz_ios.outputs.instr_path }}
+            main/${{ steps.fuzz_ios.outputs.jpeg_mapping }}
